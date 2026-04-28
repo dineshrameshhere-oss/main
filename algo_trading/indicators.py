@@ -272,27 +272,43 @@ def compute_multi_rating(
 
         structure_score = orb_sig    # -1 to +1
 
-        # ── ADX Strength Multiplier ─────────────────────────────────────────
-        if adx_val < 20:   adx_mult = 0.5     # choppy market — halve all signals
+        # ── ADX Strength Multiplier & Chopping Guard ───────────────────────
+        if adx_val < 20:   adx_mult = 0.5     # choppy market — halve signals
         elif adx_val > 25: adx_mult = 1.2     # trending — slight boost
         else:              adx_mult = 1.0
 
         # ── Volume confirmation ─────────────────────────────────────────────
-        vol_avg  = df['Volume'].rolling(20).mean().iloc[-1]
-        vol_curr = df['Volume'].iloc[-1]
-        vol_bonus = 0.1 if vol_curr > vol_avg * VOLUME_MULT_SCALP else 0.0
+        vol_avg     = df['Volume'].rolling(20).mean().iloc[-1]
+        vol_curr    = df['Volume'].iloc[-1]
+        volume_ok   = bool(vol_curr > vol_avg * VOLUME_MULT_SCALP)
+        vol_bonus   = 0.1 if volume_ok else 0.0
 
         # ── Final composite score ────────────────────────────────────────────
-        # Weighted: structure (ORB) most important for options scalping
         raw_score = (osc_score * 0.8) + (ma_score * 1.0) + (structure_score * 1.2)
         score     = raw_score * adx_mult
         if score > 0: score += vol_bonus
         if score < 0: score -= vol_bonus
 
-        # ── Rating assignment (TradingView-style thresholds) ────────────────
-        if   score >= +0.7: rating = "STRONG_BUY"
+        # ── Rating assignment ────────────────────────────────────────────────
+        # HARD RULE 1: ADX < 20 = choppy market → STRONG signals are BLOCKED
+        #   Choppy markets cause false breakouts on options scalping.
+        #   Max allowed rating in choppy market: BUY / SELL only.
+        # HARD RULE 2: STRONG signals require volume confirmation (Vol:✅)
+        #   Without volume, a breakout is likely a fake-out.
+        choppy     = adx_val < 20
+        no_volume  = not volume_ok
+
+        if   score >= +0.7:
+            if choppy or no_volume:
+                rating = "BUY"         # downgrade STRONG_BUY if choppy or no volume
+            else:
+                rating = "STRONG_BUY"
         elif score >= +0.3: rating = "BUY"
-        elif score <= -0.7: rating = "STRONG_SELL"
+        elif score <= -0.7:
+            if choppy or no_volume:
+                rating = "SELL"        # downgrade STRONG_SELL if choppy or no volume
+            else:
+                rating = "STRONG_SELL"
         elif score <= -0.3: rating = "SELL"
         else:               rating = "NEUTRAL"
 
@@ -310,9 +326,10 @@ def compute_multi_rating(
                 "structure_orb":     orb_sig,
                 "adx":               round(adx_val, 1),
                 "adx_multiplier":    adx_mult,
+                "choppy":            choppy,
                 "rsi":               round(rsi_val, 1),
                 "macd_hist":         round(macd_now, 4),
-                "volume_confirm":    bool(vol_curr > vol_avg * VOLUME_MULT_SCALP),
+                "volume_confirm":    volume_ok,
             }
         }
     except Exception as e:

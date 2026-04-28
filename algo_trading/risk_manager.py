@@ -81,18 +81,18 @@ def monitor_position(order: dict, live: bool = False,
     current_sl_floor = -DEFAULT_SL_PCT   # starts as hard SL (negative = loss allowed)
     zero_ltp_retries = 0
     tick             = 0
-    max_ticks        = 120               # 120 × 30s = 60 min max hold
+    max_ticks        = 360               # 360 × 10s = 60 min max hold
     tp_logged        = False
 
     log.info(
         f"Monitor START [{order_id}] | Entry ₹{entry:.2f} | "
         f"Hard SL ₹{hard_sl:.2f} | Initial TP ₹{initial_tp:.2f} | "
-        f"Mode: {'LIVE' if live else 'PAPER'} | Poll: 30s | Max hold: 60 min"
+        f"Mode: {'LIVE' if live else 'PAPER'} | Poll: 10s | Max hold: 60 min"
     )
     log.info(f"Stepped Trailing SL active — {len(TRAILING_STEPS)} rungs up to +200%")
 
     while tick < max_ticks:
-        time.sleep(30)     # poll every 30 seconds — enough resolution for 5-min scalp
+        time.sleep(10)     # poll every 10s — captures intraday volatility spikes
         tick += 1
 
         # ── Fetch live LTP ────────────────────────────────────────────────────
@@ -135,13 +135,14 @@ def monitor_position(order: dict, live: bool = False,
 
         effective_sl = entry * (1 + current_sl_floor)
 
-        # ── Progress log every 30s ─────────────────────────────────────────────
-        arrow = "📈" if pnl_pct >= 0 else "📉"
-        log.info(
-            f"{arrow} [{order_id}] LTP ₹{current_premium:.2f} | "
-            f"PnL {pnl_pct*100:+.1f}% (₹{pnl_amount:+.0f}) | "
-            f"Peak {peak_pnl_pct*100:.1f}% | SL floor {current_sl_floor*100:+.0f}% (₹{effective_sl:.2f})"
-        )
+        # ── Progress log every 30s (every 3 ticks at 10s) — reduce noise ──────
+        if tick % 3 == 0:
+            arrow = "📈" if pnl_pct >= 0 else "📉"
+            log.info(
+                f"{arrow} [{order_id}] LTP ₹{current_premium:.2f} | "
+                f"PnL {pnl_pct*100:+.1f}% (₹{pnl_amount:+.0f}) | "
+                f"Peak {peak_pnl_pct*100:.1f}% | SL floor {current_sl_floor*100:+.1f}% (₹{effective_sl:.2f})"
+            )
 
         # ── 1. INITIAL TP NOTIFICATION (let winner run past it) ──────────────
         if not tp_logged and current_premium >= initial_tp:

@@ -235,12 +235,13 @@ def scalp_poll():
     score  = rating['score']
     bd     = rating['breakdown']
 
+    choppy_warn = " ⚠️CHOPPY" if bd.get('choppy') else ""
     log.info(
         f"[{now.strftime('%H:%M')}] 📊 {rating['rating']} ({score:+.2f}) | "
-        f"ADX:{bd.get('adx',0):.0f} RSI:{bd.get('rsi',0):.0f} "
+        f"ADX:{bd.get('adx',0):.0f}{choppy_warn} RSI:{bd.get('rsi',0):.0f} "
         f"ORB:{bd.get('structure_orb',0):+.0f} "
         f"Vol:{'✅' if bd.get('volume_confirm') else '❌'} "
-        f"Trades today:{state.daily_trades}/3"
+        f"Trades:{state.daily_trades}/3"
     )
 
     prev_score            = state.last_rating_score
