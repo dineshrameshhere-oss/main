@@ -1,103 +1,197 @@
-import pandas as pd
+"""
+DL Engine — Real ML Inference
+==============================
+Loads pre-trained scikit-learn models from models/ directory.
+Replaces the placeholder SMA-based dummy logic entirely.
+
+Models required (run python -m algo_trading.ml_trainer to generate):
+  models/direction_model.pkl  — RandomForest predicts UP(+1)/NEUTRAL(0)/DOWN(-1)
+  models/vol_model.pkl        — GradientBoosting predicts Volume Surge YES(1)/NO(0)
+  models/vega_model.pkl       — GradientBoosting predicts Vega Expansion YES(1)/NO(0)
+  models/feature_cols.pkl     — list of feature column names used during training
+
+All features are scale-invariant (% returns, ratios, bounded oscillators).
+"""
+import pathlib
+import pickle
 import numpy as np
+import pandas as pd
+
 from .logger import log
 
-class DLEnginePlaceholder:
+MODELS_DIR = pathlib.Path(__file__).parent.parent / "models"
+
+# ── Model Loading (once at import, not on every poll) ─────────────────────────
+_dir_model   = None
+_vol_model   = None
+_vega_model  = None
+_feature_cols = None
+
+
+def _load_models():
+    global _dir_model, _vol_model, _vega_model, _feature_cols
+    required = [
+        MODELS_DIR / "direction_model.pkl",
+        MODELS_DIR / "vol_model.pkl",
+        MODELS_DIR / "vega_model.pkl",
+        MODELS_DIR / "feature_cols.pkl",
+    ]
+    missing = [str(p) for p in required if not p.exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"\n❌ ML models not found. Train them first:\n"
+            f"   python -m algo_trading.ml_trainer\n\n"
+            f"Missing: {missing}"
+        )
+    with open(MODELS_DIR / "direction_model.pkl", "rb") as f:
+        _dir_model = pickle.load(f)
+    with open(MODELS_DIR / "vol_model.pkl", "rb") as f:
+        _vol_model = pickle.load(f)
+    with open(MODELS_DIR / "vega_model.pkl", "rb") as f:
+        _vega_model = pickle.load(f)
+    with open(MODELS_DIR / "feature_cols.pkl", "rb") as f:
+        _feature_cols = pickle.load(f)
+    log.info(f"✅ ML models loaded from {MODELS_DIR} | {len(_feature_cols)} features")
+
+
+try:
+    _load_models()
+except FileNotFoundError as e:
+    log.warning(str(e))
+
+
+# ── Feature Builder (must match ml_trainer.py exactly) ───────────────────────
+LAG_BARS = 10   # must match ml_trainer.LAG_BARS
+
+
+def _build_live_features(df: pd.DataFrame) -> pd.DataFrame | None:
     """
-    Placeholder for the actual Deep Learning (Transformer/LSTM) model.
-    In the future, this class will load a .tflite or scikit-learn model and
-    run true inference. For now, it simulates the DL output so the pipeline
-    can be built and tested.
+    Given a OHLCV DataFrame of the last N 15m bars, builds the same feature
+    vector that was used during training. Returns a single-row DataFrame.
     """
-    def __init__(self, model_path: str = "models/intraday_transformer.tflite"):
-        self.model_path = model_path
-        self.is_loaded = False
-        self._load_model()
+    if len(df) < LAG_BARS + 15:
+        log.warning(f"Not enough bars for ML inference: need {LAG_BARS + 15}, got {len(df)}")
+        return None
 
-    def _load_model(self):
-        # TODO: Implement actual model loading here (e.g., tflite_runtime.Interpreter)
-        # log.info(f"Loaded Intraday DL Model from {self.model_path}")
-        self.is_loaded = True
+    d = df.copy()
 
-    def predict(self, df: pd.DataFrame) -> dict:
-        """
-        Runs inference on the latest N candles.
-        Returns probabilities (0 to 1) for Direction, Volume Surge, and Volatility Expansion.
-        """
-        if df.empty or len(df) < 20:
-            return {"direction_bull": 0.5, "direction_bear": 0.5, "vol_surge_prob": 0.0, "volatility_prob": 0.0}
+    # Base features (scale-invariant)
+    d["close_pct"]    = d["Close"].pct_change() * 100
+    d["high_low_pct"] = (d["High"] - d["Low"]) / d["Close"].shift(1) * 100
+    d["vol_ratio"]    = d["Volume"] / d["Volume"].rolling(20).mean().replace(0, 1)
 
-        # --- SIMULATED DL INFERENCE ---
-        # We simulate the AI's predictions using recent price action so the backtester has data to work with.
-        
-        close = df['Close'].iloc[-1]
-        sma20 = df['Close'].rolling(20).mean().iloc[-1]
-        
-        # 1. Direction Probability
-        bull_prob = 0.8 if close > sma20 * 1.002 else 0.4
-        bear_prob = 0.8 if close < sma20 * 0.998 else 0.4
+    tr = pd.concat([
+        (d["High"] - d["Low"]),
+        (d["High"] - d["Close"].shift(1)).abs(),
+        (d["Low"]  - d["Close"].shift(1)).abs()
+    ], axis=1).max(axis=1)
+    d["atr_pct"] = tr.rolling(14).mean() / d["Close"] * 100
 
-        # 2. Volume Surge Probability
-        vol_avg = df['Volume'].rolling(20).mean().iloc[-1]
-        vol_now = df['Volume'].iloc[-1]
-        vol_surge_prob = 0.9 if vol_now > vol_avg * 1.2 else 0.3
+    delta = d["Close"].diff()
+    gain  = delta.clip(lower=0).rolling(14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14).mean().replace(0, 1e-9)
+    d["rsi"] = 100 - (100 / (1 + gain / loss))
+    d["adx_proxy"] = tr.rolling(14).mean() / d["Close"] * 1000
 
-        # 3. Volatility Expansion Probability (Vega)
-        atr_14 = (df['High'] - df['Low']).rolling(14).mean().iloc[-1]
-        recent_range = df['High'].iloc[-1] - df['Low'].iloc[-1]
-        volatility_prob = 0.85 if recent_range > atr_14 * 1.1 else 0.4
+    d["hour"]    = d.index.hour
+    d["minute"]  = d.index.minute
+    d["weekday"] = d.index.dayofweek
 
-        return {
-            "direction_bull": bull_prob,
-            "direction_bear": bear_prob,
-            "vol_surge_prob": vol_surge_prob,
-            "volatility_prob": volatility_prob
-        }
+    # Lag features
+    for lag in range(1, LAG_BARS + 1):
+        d[f"cp_lag{lag}"]  = d["close_pct"].shift(lag)
+        d[f"vr_lag{lag}"]  = d["vol_ratio"].shift(lag)
+        d[f"rsi_lag{lag}"] = d["rsi"].shift(lag)
+        d[f"hl_lag{lag}"]  = d["high_low_pct"].shift(lag)
 
-# Singleton instance to avoid reloading weights repeatedly
-dl_model = DLEnginePlaceholder()
+    d.dropna(inplace=True)
+    if d.empty:
+        return None
 
+    # Use the last row (current bar)
+    row = d.iloc[[-1]][_feature_cols]
+    return row
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
 def compute_dl_rating(df: pd.DataFrame) -> dict:
     """
-    Called by the intraday_scheduler and backtest_intraday.
-    Evaluates the DL model and returns a composite Intraday Rating.
+    Runs live ML inference on the last N 15m candles.
+    Returns a rating dict compatible with intraday_scheduler and backtest_intraday.
+
+    Entry is only STRONG_BUY/SELL when ALL THREE signals agree:
+      direction is UP/DOWN  AND  vol surge likely  AND  vega expansion likely.
+    This prevents entering when the option premium is likely to decay.
     """
+    neutral = {"score": 0.0, "rating": "NEUTRAL", "direction": "NONE", "breakdown": {}}
+
+    if _dir_model is None:
+        log.error("❌ ML models not loaded. Run: python -m algo_trading.ml_trainer")
+        return neutral
+
     try:
-        preds = dl_model.predict(df)
-        
-        bull_p = preds["direction_bull"]
-        bear_p = preds["direction_bear"]
-        vol_p  = preds["vol_surge_prob"]
-        vega_p = preds["volatility_prob"]
+        row = _build_live_features(df)
+        if row is None:
+            return neutral
 
-        # Intraday trades require CONFIDENCE in both direction AND expansion.
-        # Options buying decays over hours, so we MUST have high Volatility/Volume probability.
-        
-        rating = "NEUTRAL"
+        # Predict class labels
+        dir_pred  = int(_dir_model.predict(row)[0])     # -1, 0, or +1
+        vol_pred  = int(_vol_model.predict(row)[0])     # 0 or 1
+        vega_pred = int(_vega_model.predict(row)[0])    # 0 or 1
+
+        # Predict probabilities for richer breakdown
+        dir_proba  = _dir_model.predict_proba(row)[0]   # [P(down), P(neutral), P(up)]
+        vol_proba  = _vol_model.predict_proba(row)[0]   # [P(no), P(yes)]
+        vega_proba = _vega_model.predict_proba(row)[0]  # [P(no), P(yes)]
+
+        # Map direction probabilities
+        dir_classes = list(_dir_model.classes_)
+        p_up    = dir_proba[dir_classes.index(1)]  if  1 in dir_classes else 0.0
+        p_down  = dir_proba[dir_classes.index(-1)] if -1 in dir_classes else 0.0
+        p_vol   = vol_proba[-1]
+        p_vega  = vega_proba[-1]
+
+        # Rating logic: need STRONG direction + volume surge + vega expansion
+        # to justify buying an option (theta decay kills weak signals intraday)
+        rating    = "NEUTRAL"
         direction = "NONE"
-        score = 0.0
+        score     = 0.0
 
-        if bull_p > 0.70 and vol_p > 0.60 and vega_p > 0.60:
-            rating = "STRONG_BUY"
+        if dir_pred == 1 and vol_pred == 1 and vega_pred == 1:
+            rating    = "STRONG_BUY"
             direction = "CALL"
-            score = bull_p * 100
+            score     = p_up * 100
 
-        elif bear_p > 0.70 and vol_p > 0.60 and vega_p > 0.60:
-            rating = "STRONG_SELL"
+        elif dir_pred == -1 and vol_pred == 1 and vega_pred == 1:
+            rating    = "STRONG_SELL"
             direction = "PUT"
-            score = bear_p * -100
+            score     = p_down * -100
+
+        elif dir_pred == 1 and (vol_pred == 1 or vega_pred == 1):
+            rating    = "BUY"
+            direction = "CALL"
+            score     = p_up * 60
+
+        elif dir_pred == -1 and (vol_pred == 1 or vega_pred == 1):
+            rating    = "SELL"
+            direction = "PUT"
+            score     = p_down * -60
 
         return {
-            "score": score,
-            "rating": rating,
+            "score":     round(score, 2),
+            "rating":    rating,
             "direction": direction,
             "breakdown": {
-                "dl_bull_prob": round(bull_p, 2),
-                "dl_bear_prob": round(bear_p, 2),
-                "dl_vol_prob":  round(vol_p, 2),
-                "dl_vega_prob": round(vega_p, 2)
-            }
+                "ml_dir_pred":    dir_pred,
+                "ml_vol_pred":    vol_pred,
+                "ml_vega_pred":   vega_pred,
+                "p_up":           round(p_up,   3),
+                "p_down":         round(p_down,  3),
+                "p_vol_surge":    round(p_vol,   3),
+                "p_vega_expand":  round(p_vega,  3),
+            },
         }
+
     except Exception as e:
-        log.error(f"DL Rating Error: {e}")
-        return {"score": 0, "rating": "NEUTRAL", "direction": "NONE", "breakdown": {}}
+        log.error(f"ML inference error: {e}")
+        return neutral

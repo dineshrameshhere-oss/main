@@ -115,18 +115,23 @@ def run_intraday_backtest(initial_capital=5000.0, days=60):
             entry       = position['entry_price']
             entry_spot  = position['entry_spot']
             
-            # Use % move of Nifty (scale-invariant: works on 1107 and 24000)
-            nifty_move_pct = (current_bar['Close'] - entry_spot) / entry_spot
+            # Option P&L simulation (scale-invariant):
+            # Nifty % move × delta × ATM premium (₹180) = option price change
+            # delta=0.55 for OTM intraday buys
+            nifty_move_pct = (current_bar['Close'] - entry_spot) / max(abs(entry_spot), 1e-6)
             if position['direction'] == 'PUT':
                 nifty_move_pct = -nifty_move_pct
-                
-            # Estimate option move: delta ~0.55 for OTM intraday buys
-            est_delta   = 0.55
-            # Scale by notional Nifty (use approx 24000 for realistic option move)
-            NIFTY_NOTIONAL = 24000.0
-            option_move = nifty_move_pct * NIFTY_NOTIONAL * est_delta
-            est_option_price = entry + option_move
-            pnl_pct = ((est_option_price - entry) / entry) * 100
+
+            # Intraday ATM Nifty option: ₹180 premium, lot 25
+            # A 1% Nifty move with delta 0.55 → option moves ~0.55% of underlying
+            # expressed as % of premium: (nifty_move_pct × 24000 × 0.55) / 180
+            REAL_NIFTY    = 24000.0   # approximate real Nifty level for option delta scaling
+            ATM_PREMIUM   = 180.0
+            DELTA         = 0.55
+            option_move   = nifty_move_pct * REAL_NIFTY * DELTA
+            est_option_price = ATM_PREMIUM + option_move
+            pnl_pct = ((est_option_price - ATM_PREMIUM) / ATM_PREMIUM) * 100
+
             
             # SL hit
             if pnl_pct <= INTRADAY_SL_PCT:
@@ -179,26 +184,31 @@ def run_intraday_backtest(initial_capital=5000.0, days=60):
         if bar_time.hour == 12 or (bar_time.hour == 13 and bar_time.minute <= 15): continue
         if bar_time.hour >= 14 and bar_time.minute >= 45: continue
         
-        # Get Deep Learning Rating
+        # Get ML Rating — accept STRONG and regular BUY/SELL
+        # STRONG = direction + vol surge + vega expansion (all 3 confirmed)
+        # BUY/SELL = direction + at least 1 of vol/vega confirmed
         rating = compute_dl_rating(window)
+        bd     = rating.get("breakdown", {})
         
-        if rating['rating'] in ["STRONG_BUY", "STRONG_SELL"]:
-            # Mock Premium
-            mock_premium = 180.0
-            qty = LOT_SIZE
-            
-            if mock_premium * qty > capital:
-                continue # not enough capital
-                
-            position = {
-                'entry_time': current_bar.name,
-                'direction': 'CALL' if rating['rating'] == 'STRONG_BUY' else 'PUT',
-                'entry_spot': current_bar['Close'],
-                'entry_price': mock_premium,
-                'bars_held': 0,
-                'score': rating['score'],
-                'dl_stats': rating['breakdown']
-            }
+        if rating['rating'] not in ["STRONG_BUY", "STRONG_SELL", "BUY", "SELL"]:
+            continue
+        if rating['direction'] == "NONE":
+            continue
+
+        mock_premium = 180.0
+        if mock_premium * LOT_SIZE > capital:
+            continue  # not enough capital
+
+        position = {
+            'entry_time':  current_bar.name,
+            'direction':   rating['direction'],
+            'entry_spot':  current_bar['Close'],
+            'entry_price': mock_premium,
+            'bars_held':   0,
+            'score':       rating['score'],
+            'rating':      rating['rating'],
+            'dl_stats':    bd,
+        }
 
     # ── Print Report ──────────────────────────────────────────────────────────
     print("\n" + "="*56)
