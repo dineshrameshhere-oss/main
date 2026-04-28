@@ -9,8 +9,8 @@ from .market_data import fetch_historical_ohlcv, compress_ohlcv_to_string, fetch
 from .news_fetcher import fetch_nifty_news
 from .indicators import compute_key_levels, compute_scalp_signals
 from .llm_analyst import analyze_premarket, analyze_market_open
-from .options_engine import select_strike, calculate_qty
-from .trade_executor import place_order
+from .options_engine import select_strike, calculate_qty, calculate_dynamic_risk
+from .trade_executor import place_order, get_balance
 from .risk_manager import monitor_position
 
 # Global state
@@ -65,6 +65,12 @@ def execute_scalp_trade(direction):
         
     log.info(f"🚀 Initializing SCALP check for {direction}")
     
+    # Check current balance first
+    current_balance = get_balance(state.live_mode)
+    if current_balance < 1500.0:
+        log.warning(f"⚠️ Balance too low to trade safely (₹{current_balance:.2f}). Waiting for deposit.")
+        return
+    
     # Need current spot price
     df_3m = fetch_intraday_data(interval='5m', period='1d')
     if df_3m.empty: return
@@ -81,17 +87,21 @@ def execute_scalp_trade(direction):
     if direction == "SCALP_AUTO":
         direction = signals["direction"]
         
-    strike_info = select_strike(direction, spot)
+    strike_info = select_strike(direction, spot, current_balance)
     premium = strike_info["simulated_premium"]
     
-    qty, cost, lots = calculate_qty(MAX_TRADE_BUDGET, premium)
+    qty, cost, lots = calculate_qty(current_balance, premium)
     
     if qty == 0: return
     
-    sl_price = premium * (1 - DEFAULT_SL_PCT)
-    tp_price = premium * (1 + DEFAULT_TP_PCT)
+    # Dynamic Risk Profiling based on Premium Quality
+    sl_pct, tp_pct = calculate_dynamic_risk(premium)
+    
+    sl_price = premium * (1 - sl_pct)
+    tp_price = premium * (1 + tp_pct)
     
     log.info(f"🎯 Selected: NIFTY {strike_info['strike']} {strike_info['type']} | Premium: ₹{premium:.2f} | Qty: {qty} | Cost: ₹{cost:.2f}")
+    log.info(f"🛡️ Dynamic Risk Config: SL {sl_pct*100}% | TP {tp_pct*100}%")
     
     order = place_order(strike_info['security_id'], direction, qty, premium, sl_price, tp_price, state.live_mode)
     if order:

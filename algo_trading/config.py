@@ -25,11 +25,11 @@ TIME_MARKET_OPEN  = "09:30"             # Step 3: first 30-min candle analysis
 TIME_EOD_CHECK    = "15:15"             # Close all open positions before expiry
 
 # ── SCALPING indicators (1-min / 3-min chart)
-EMA_FAST          = 9
-EMA_SLOW          = 21
+EMA_FAST          = 5           # Changed from 9 to 5 for faster 5m entries
+EMA_SLOW          = 13          # Changed from 21 to 13 for faster 5m entries
 RSI_PERIOD        = 14
-RSI_OVERBOUGHT    = 72
-RSI_OVERSOLD      = 28
+RSI_OVERBOUGHT    = 75          # Relaxed slightly to not miss strong trends
+RSI_OVERSOLD      = 25          # Relaxed slightly to not miss strong trends
 SUPERTREND_PERIOD = 10
 SUPERTREND_MULT   = 3.0
 VWAP_ENABLED      = True

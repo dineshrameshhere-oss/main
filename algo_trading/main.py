@@ -15,10 +15,17 @@ def print_banner():
     print(f"🧠 AI Engine    : Google Gemini 2.0")
     print("="*50)
 
+import sys
+
 def main():
     load_dotenv()
     print_banner()
     
+    if "--startScalp" in sys.argv:
+        log.info("⚡ --startScalp flag detected. Bypassing prompts and starting PAPER scalper immediately.")
+        start_scheduler(live_mode=False)
+        return
+        
     ans = input("▶️ Start in LIVE TRADING mode? (Type YES to confirm): ").strip()
     live_mode = (ans == "YES")
     

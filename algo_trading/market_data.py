@@ -1,5 +1,4 @@
 import pandas as pd
-import yfinance as yf
 import requests
 import os
 from .config import INDSTOCKS_BASE, NIFTY_SCRIP_CODE
@@ -7,35 +6,59 @@ from .logger import log
 
 def get_auth_headers():
     token = os.getenv("INDSTOCKS_TOKEN", "")
-    return {"Authorization": f"Bearer {token}"}
+    return {"Authorization": token}
+
+def _fetch_indstocks_chart(interval='5minute', days_back=1):
+    """
+    Fetches chart data from INDMoney API.
+    Valid intervals: 1minute, 5minute, 15minute, 30minute, 60minute, 1day, 1week, 1month
+    """
+    try:
+        import time
+        end_time = int(time.time() * 1000)
+        start_time = end_time - (days_back * 24 * 60 * 60 * 1000)
+        url = f"{INDSTOCKS_BASE}/market/historical/{interval}?scrip-codes={NIFTY_SCRIP_CODE}&start_time={start_time}&end_time={end_time}"
+        res = requests.get(url, headers=get_auth_headers(), timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            scrip_data = data.get('data', {}).get(NIFTY_SCRIP_CODE, {})
+            candles = scrip_data.get('candles', [])
+            if candles:
+                df = pd.DataFrame(candles)
+                df.rename(columns={'ts': 'Timestamp', 'o': 'Open', 'h': 'High', 'l': 'Low', 'c': 'Close', 'v': 'Volume'}, inplace=True)
+                # Convert epoch seconds to datetime
+                df['Date'] = pd.to_datetime(df['Timestamp'], unit='s')
+                df.set_index('Date', inplace=True)
+                return df
+            else:
+                print(f"INDMoney returned 200 OK but no candle data found: {data}")
+                log.warning(f"INDMoney returned 200 OK but no candle data found: {data}")
+        else:
+            print(f"INDMoney Chart API Error: {res.status_code} - {res.text}")
+            log.error(f"INDMoney Chart API Error: {res.status_code} - {res.text}")
+    except Exception as e:
+        print(f"Exception fetching INDMoney Chart: {e}")
+        log.error(f"Exception fetching INDMoney Chart: {e}")
+    return pd.DataFrame()
 
 def fetch_historical_ohlcv(timeframes=['1mo', '1wk', '1h']):
     """
-    Fetches historical OHLCV data using yfinance as fallback 
-    (since IndStocks historical data often requires specific subscription).
-    Symbol: ^NSEI (Nifty 50)
+    Fetches historical OHLCV data directly from INDMoney API.
     """
     data = {}
-    ticker = yf.Ticker("^NSEI")
     
     try:
         if '1mo' in timeframes:
-            # Last 6 months
-            df_mo = ticker.history(period="6mo", interval="1mo")
-            data['1mo'] = df_mo
+            data['1mo'] = _fetch_indstocks_chart(interval='1month', days_back=180)
             
         if '1wk' in timeframes:
-            # Last 12 weeks (~3 months)
-            df_wk = ticker.history(period="3mo", interval="1wk")
-            data['1wk'] = df_wk
+            data['1wk'] = _fetch_indstocks_chart(interval='1week', days_back=90)
             
         if '1h' in timeframes:
-            # Last 5 days
-            df_h = ticker.history(period="5d", interval="1h")
-            data['1h'] = df_h
+            data['1h'] = _fetch_indstocks_chart(interval='60minute', days_back=5)
             
     except Exception as e:
-        log.error(f"❌ Error fetching historical data: {e}")
+        log.error(f"❌ Error fetching historical INDMoney data: {e}")
         
     return data
 
@@ -45,6 +68,7 @@ def compress_ohlcv_to_string(df, timeframe, n_candles=5):
     Format: DATE|O|H|L|C|V|CHG%
     """
     if df is None or df.empty:
+        print("Failed to fetch data from INDMoney. Please check if your INDSTOCKS_TOKEN in .env is valid and active.")
         return f"NIFTY50 | {timeframe} | NO DATA"
         
     df = df.tail(n_candles).copy()
@@ -69,24 +93,17 @@ def compress_ohlcv_to_string(df, timeframe, n_candles=5):
         
     return "\n".join(lines)
 
-def fetch_intraday_data(interval='5m', period='1d'):
+def fetch_intraday_data(interval='5minute', days_back=1):
     """
-    Fetches intraday data. For the bot, we mainly need 5m for SCALP.
-    Using yfinance for reliable free data.
+    Fetches 5m intraday data directly from INDMoney for SCALP.
     """
-    ticker = yf.Ticker("^NSEI")
-    try:
-        df = ticker.history(period=period, interval=interval)
-        return df
-    except Exception as e:
-        log.error(f"❌ Error fetching intraday {interval} data: {e}")
-        return pd.DataFrame()
+    return _fetch_indstocks_chart(interval=interval, days_back=days_back)
 
 def fetch_first_30min_candle():
     """
-    Simulates fetching the first 30-min data of the day.
+    Fetches the first 30-min data of the day from INDMoney.
     """
-    df = fetch_intraday_data(interval='30m', period='1d')
+    df = _fetch_indstocks_chart(interval='30minute', days_back=1)
     if not df.empty:
         row = df.iloc[0]
         return {
@@ -101,24 +118,16 @@ def fetch_first_30min_candle():
 
 def fetch_ltp(scrip_code=NIFTY_SCRIP_CODE):
     """
-    Fetch Last Traded Price from IndStocks API.
-    If fails, fallback to yfinance.
+    Fetch Last Traded Price directly from INDMoney API.
     """
     try:
         url = f"{INDSTOCKS_BASE}/market/quotes/ltp?scrip-codes={scrip_code}"
         res = requests.get(url, headers=get_auth_headers(), timeout=5)
         if res.status_code == 200:
             data = res.json()
-            return float(data.get('data', {}).get(scrip_code, {}).get('ltp', 0))
-    except Exception:
-        pass
-    
-    # Fallback
-    try:
-        df = fetch_intraday_data(interval='1m', period='1d')
-        if not df.empty:
-            return float(df['Close'].iloc[-1])
-    except:
-        pass
-        
+            return float(data.get('data', {}).get(scrip_code, {}).get('live_price', 0))
+        else:
+            log.error(f"❌ INDMoney LTP API Error: {res.status_code} - {res.text}")
+    except Exception as e:
+        log.error(f"❌ Exception fetching INDMoney LTP: {e}")
     return 0.0

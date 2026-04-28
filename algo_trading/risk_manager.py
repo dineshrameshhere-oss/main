@@ -37,14 +37,14 @@ def monitor_position(order: dict, live: bool = False):
         if current_premium <= sl:
             pnl_amount = (current_premium - entry) * qty
             log.warning(f"🛑 STOP LOSS HIT! Exit: ₹{current_premium:.2f} | Loss: ₹{pnl_amount:.2f}")
-            close_order(order_id, "STOP_LOSS", live)
+            close_order(order_id, "STOP_LOSS", pnl=pnl_amount, live=live)
             break
             
         # 2. HARD TAKE PROFIT
         if current_premium >= tp:
             pnl_amount = (current_premium - entry) * qty
             log.info(f"🎯 TAKE PROFIT HIT! Exit: ₹{current_premium:.2f} | Profit: ₹{pnl_amount:.2f}")
-            close_order(order_id, "TAKE_PROFIT", live)
+            close_order(order_id, "TAKE_PROFIT", pnl=pnl_amount, live=live)
             break
             
         # 3. TRAILING STOP (Activates if we are up at least 5%)
@@ -54,7 +54,7 @@ def monitor_position(order: dict, live: bool = False):
             if current_premium <= trailing_sl:
                 pnl_amount = (current_premium - entry) * qty
                 log.info(f"🏃 TRAILING STOP HIT! Exit: ₹{current_premium:.2f} | PnL: ₹{pnl_amount:.2f}")
-                close_order(order_id, "TRAILING_STOP", live)
+                close_order(order_id, "TRAILING_STOP", pnl=pnl_amount, live=live)
                 break
                 
         time.sleep(5) # Poll every 5 seconds for scalping
