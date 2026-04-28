@@ -214,8 +214,23 @@ def run_backtest(initial_capital: float = 5000.0):
             est_delta = min(0.8, max(0.2, current_premium_target / 300.0))
             bars_held = i - entry_bar_idx
 
-            # ── Compute bar's best PnL% in option-premium terms ───────────────
-            # Premium move ≈ Nifty move × delta / entry_premium
+            # ── THETA DECAY: realistic intraday option premium decay ─────────────
+            # Nifty ATM options lose ~3.5 Rs/day to time decay (theta)
+            # Distribute linearly across trading hours (9:15-15:30 = 6.25 hours)
+            time_h = row.name.time().hour
+            time_m = row.name.time().minute
+            hours_into_day = (time_h - 9.25) + (time_m / 60.0)
+            hours_into_day = max(0, min(6.5, hours_into_day))  # clamp to [0, 6.5]
+            
+            theta_per_day = -3.5  # Rs/day realistic for ATM Nifty options (was -5.0)
+            cumulative_theta = theta_per_day * (hours_into_day / 6.5)  # theta so far today
+            
+            # ── GAMMA: positive acceleration for ATM option buyers ──────────────
+            # Gamma reward: 0.5 × spot_move² × gamma_factor
+            # ATM Nifty options have gamma ~0.001
+            gamma_factor = 0.001
+            
+            # Compute bar's nifty moves first (before gamma calculation)
             if trade_dir == 1:
                 best_nifty_move = row['High'] - entry_price
                 close_nifty_move = row['Close'] - entry_price
@@ -223,8 +238,13 @@ def run_backtest(initial_capital: float = 5000.0):
                 best_nifty_move  = entry_price - row['Low']
                 close_nifty_move = entry_price - row['Close']
 
-            bar_best_pnl_pct  = (best_nifty_move  * est_delta) / max(current_premium_target, 1)
-            bar_close_pnl_pct = (close_nifty_move * est_delta) / max(current_premium_target, 1)
+            best_gamma_pnl = 0.5 * (best_nifty_move ** 2) * gamma_factor if best_nifty_move != 0 else 0
+            close_gamma_pnl = 0.5 * (close_nifty_move ** 2) * gamma_factor if close_nifty_move != 0 else 0
+            
+            # Compute bar's best PnL% in option-premium terms
+            # Premium move ≈ Nifty move × delta + gamma_acceleration + theta_decay
+            bar_best_pnl_pct  = ((best_nifty_move * est_delta) + best_gamma_pnl + cumulative_theta) / max(current_premium_target, 1)
+            bar_close_pnl_pct = ((close_nifty_move * est_delta) + close_gamma_pnl + cumulative_theta) / max(current_premium_target, 1)
 
             # Track peak (for trailing SL ratchet)
             if bar_best_pnl_pct > peak_pnl_pct:
@@ -328,9 +348,15 @@ def run_backtest(initial_capital: float = 5000.0):
         # ATM CE ≈ ATM PE at parity, so reuse daily_atm_premium for both sides.
         # PE is fetched separately only if CE and PE diverge significantly.
         ATM_PREMIUM  = daily_atm_premium          # already fetched at day boundary
+        
+        # Apply realistic bid-ask spread: ATM Nifty options are liquid (~1% spread)
+        # Entry price (we buy at ask): premium * 1.01 (1% slip on entry)
+        # Exit price is better since we sell at better fill
+        entry_premium_with_spread = ATM_PREMIUM * 1.01  # 1% entry slip (more realistic)
+        
         MAX_BUDGET   = min(capital * 0.30, 2000.0)
-        qty          = max(1, int(MAX_BUDGET / ATM_PREMIUM))
-        premium_target = ATM_PREMIUM
+        qty          = max(1, int(MAX_BUDGET / entry_premium_with_spread))
+        premium_target = entry_premium_with_spread
         if premium_target * qty > capital:
             continue
 
