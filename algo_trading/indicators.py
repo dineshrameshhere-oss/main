@@ -1,10 +1,14 @@
 import pandas as pd
 import numpy as np
+import math
 from .logger import log
 from .config import (
     SUPERTREND_PERIOD, SUPERTREND_MULT,
     EMA_FAST, EMA_SLOW, RSI_PERIOD,
-    VOLUME_MULT_SCALP, RSI_OVERBOUGHT, RSI_OVERSOLD
+    VOLUME_MULT_SCALP, RSI_OVERBOUGHT, RSI_OVERSOLD,
+    CANDLE_MIN_BODY_RATIO, CANDLE_REJECTION_WICK,
+    MOMENTUM_BARS, MOMENTUM_MIN_MOVE_PCT,
+    MIN_NIFTY_HOURLY_RANGE_PCT,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -183,6 +187,123 @@ def compute_orb_series(df: pd.DataFrame) -> pd.DataFrame:
 #    score <= -0.3  → SELL        → Buy PE
 #    else           → NEUTRAL     → Skip
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CANDLE QUALITY — false breakout filter
+# ─────────────────────────────────────────────────────────────────────────────
+def _candle_quality(df: pd.DataFrame, direction: str) -> dict:
+    """
+    Analyses the last bar for doji / rejection candle patterns.
+
+    Returns:
+        {
+          'is_rejection': bool  — True = skip this entry,
+          'body_ratio':   float — body / total range (0–1),
+          'reason':       str
+        }
+
+    A rejection candle is one of:
+      • Doji: body < 30% of total range (indecision)
+      • Bearish rejection on bullish signal: upper wick > 2× body (price tried up, got slapped)
+      • Bullish rejection on bearish signal: lower wick > 2× body (price tried down, got bid up)
+    """
+    try:
+        row   = df.iloc[-1]
+        open_ = float(row['Open'])
+        high  = float(row['High'])
+        low   = float(row['Low'])
+        close = float(row['Close'])
+
+        total_range = high - low
+        if total_range < 0.01:
+            return {'is_rejection': False, 'body_ratio': 1.0, 'reason': 'flat_bar'}
+
+        body        = abs(close - open_)
+        upper_wick  = high - max(open_, close)
+        lower_wick  = min(open_, close) - low
+        body_ratio  = body / total_range
+
+        # Doji — total indecision regardless of direction
+        if body_ratio < CANDLE_MIN_BODY_RATIO:
+            return {'is_rejection': True, 'body_ratio': round(body_ratio, 2),
+                    'reason': f'doji (body={body_ratio:.0%} < {CANDLE_MIN_BODY_RATIO:.0%})'}
+
+        # Rejection wick on bullish signal (bearish pin bar)
+        if direction == 'SCALP_LONG' and body > 0:
+            if upper_wick > CANDLE_REJECTION_WICK * body:
+                return {'is_rejection': True, 'body_ratio': round(body_ratio, 2),
+                        'reason': f'bearish_rejection_wick (upper={upper_wick:.1f} > {CANDLE_REJECTION_WICK}×body={body:.1f})'}
+
+        # Rejection wick on bearish signal (bullish pin bar)
+        if direction == 'SCALP_SHORT' and body > 0:
+            if lower_wick > CANDLE_REJECTION_WICK * body:
+                return {'is_rejection': True, 'body_ratio': round(body_ratio, 2),
+                        'reason': f'bullish_rejection_wick (lower={lower_wick:.1f} > {CANDLE_REJECTION_WICK}×body={body:.1f})'}
+
+        return {'is_rejection': False, 'body_ratio': round(body_ratio, 2), 'reason': 'ok'}
+    except Exception as e:
+        return {'is_rejection': False, 'body_ratio': 0.5, 'reason': f'error:{e}'}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MOMENTUM FILTER — require directional move before entry
+# ─────────────────────────────────────────────────────────────────────────────
+def _momentum_signal(df: pd.DataFrame, direction: str) -> dict:
+    """
+    Returns whether the last MOMENTUM_BARS bars show directional momentum.
+    Uses % move relative to current price (scale-invariant).
+
+    For SCALP_LONG:  (Close[-1] - Close[-MOMENTUM_BARS]) / Close[-MOMENTUM_BARS] > PCT
+    For SCALP_SHORT: (Close[-MOMENTUM_BARS] - Close[-1])  / Close[-MOMENTUM_BARS] > PCT
+    """
+    try:
+        if len(df) < MOMENTUM_BARS + 1:
+            return {'ok': True, 'move_pct': 0, 'required_pct': MOMENTUM_MIN_MOVE_PCT}
+
+        close_now  = float(df['Close'].iloc[-1])
+        close_back = float(df['Close'].iloc[-MOMENTUM_BARS])
+        ref        = max(close_back, 1e-6)
+
+        if direction == 'SCALP_LONG':
+            move_pct = (close_now - close_back) / ref
+        else:
+            move_pct = (close_back - close_now) / ref
+
+        return {
+            'ok':           move_pct >= MOMENTUM_MIN_MOVE_PCT,
+            'move_pct':     round(move_pct * 100, 3),
+            'required_pct': MOMENTUM_MIN_MOVE_PCT * 100,
+        }
+    except Exception as e:
+        return {'ok': True, 'move_pct': 0, 'required_pct': MOMENTUM_MIN_MOVE_PCT * 100}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  REALIZED VOLATILITY GATE — skip flat days
+# ─────────────────────────────────────────────────────────────────────────────
+def check_rv_gate(df: pd.DataFrame) -> dict:
+    """
+    Checks if today's Nifty range (High-Low over last 12 bars = 1 hour)
+    exceeds MIN_NIFTY_HOURLY_RANGE_PCT of current price.
+    Scale-invariant: works on both scaled (~1107) and real (~24000) price data.
+    """
+    try:
+        look    = min(12, len(df))    # 12 × 5m = 60 min
+        recent  = df.iloc[-look:]
+        current_price  = float(df['Close'].iloc[-1])
+        hourly_range   = float(recent['High'].max() - recent['Low'].min())
+        range_pct      = hourly_range / max(current_price, 1e-6)
+        required_pct   = MIN_NIFTY_HOURLY_RANGE_PCT
+        return {
+            'ok':        range_pct >= required_pct,
+            'range_pts': round(hourly_range, 2),
+            'range_pct': round(range_pct * 100, 3),
+            'required':  required_pct * 100,
+        }
+    except Exception as e:
+        return {'ok': True, 'range_pts': 0, 'range_pct': 0, 'required': 0}
+
+
 def _rsi_signal(rsi: float) -> float:
     if 55 <= rsi <= 75:  return +1.0   # bullish momentum
     if 25 <= rsi <= 45:  return -1.0   # bearish momentum
@@ -210,9 +331,11 @@ def compute_multi_rating(
     rsi_series: pd.Series,
     adx_val: float,
     macd_hist: pd.Series,
+    pcr: dict | None = None,
 ) -> dict:
     """
     Computes the multi-indicator composite rating at the LAST bar of df.
+    PCR (Put-Call Ratio) is an optional 5th component: pass the dict from compute_pcr().
 
     Returns:
         {
@@ -277,14 +400,57 @@ def compute_multi_rating(
         elif adx_val > 25: adx_mult = 1.2     # trending — slight boost
         else:              adx_mult = 1.0
 
+        # ── OI Coverage (4 types from price+volume trend) ────────────────────
+        # Industry-standard OI interpretation applied to underlying OHLCV:
+        #   Price UP   + Volume UP   → Long Buildup   (fresh longs entering)    +1.0
+        #   Price DOWN + Volume UP   → Short Buildup  (fresh shorts entering)   -1.0
+        #   Price UP   + Volume DOWN → Short Covering (shorts exiting, weak)    +0.4
+        #   Price DOWN + Volume DOWN → Long Unwinding (longs exiting, weak)     -0.4
+        price_move  = close - (df['Close'].iloc[-6] if len(df) >= 6 else close)
+        vol_now     = df['Volume'].iloc[-1]
+        vol_ma6     = df['Volume'].iloc[-6:].mean() if len(df) >= 6 else vol_now
+        vol_rising  = vol_now > vol_ma6 * 1.05    # 5% above recent avg = rising
+
+        if price_move > 0 and vol_rising:
+            oi_type = 'LONG_BUILDUP';   oi_score = +1.0
+        elif price_move < 0 and vol_rising:
+            oi_type = 'SHORT_BUILDUP';  oi_score = -1.0
+        elif price_move > 0 and not vol_rising:
+            oi_type = 'SHORT_COVERING'; oi_score = +0.4
+        elif price_move < 0 and not vol_rising:
+            oi_type = 'LONG_UNWINDING'; oi_score = -0.4
+        else:
+            oi_type = 'NEUTRAL';        oi_score =  0.0
+
         # ── Volume confirmation ─────────────────────────────────────────────
         vol_avg     = df['Volume'].rolling(20).mean().iloc[-1]
         vol_curr    = df['Volume'].iloc[-1]
         volume_ok   = bool(vol_curr > vol_avg * VOLUME_MULT_SCALP)
         vol_bonus   = 0.1 if volume_ok else 0.0
 
-        # ── Final composite score ────────────────────────────────────────────
-        raw_score = (osc_score * 0.8) + (ma_score * 1.0) + (structure_score * 1.2)
+        # ── PCR (Put-Call Ratio) as 5th scoring component ───────────────────────
+        # PCR captures volatility sentiment from the options market:
+        #   PCR < 0.7  (more calls = bullish sentiment)  → positive score boost
+        #   PCR > 1.3  (more puts  = bearish sentiment)  → negative score boost
+        #   PCR 0.7–1.3 (neutral)                        → ~0
+        # Formula: (1.0 - pcr) * 0.5, clamped to [-0.5, +0.5]
+        pcr_val = float(pcr.get('pcr', 1.0)) if pcr else 1.0
+        pcr_score = max(-0.5, min(0.5, (1.0 - pcr_val) * 0.5))
+
+        # ── Final composite score (5 components) ────────────────────────────
+        # Weight rationale:
+        #   OI Coverage  (1.1) — smart money flow: strongest predictor for scalp
+        #   Structure    (1.0) — ORB breakout: key for intraday momentum
+        #   MA           (0.9) — trend confirmation
+        #   Oscillators  (0.7) — RSI/MACD/Stoch: entry timing
+        #   PCR          (0.4) — options market sentiment: supporting signal
+        raw_score = (
+            osc_score       * 0.7 +
+            ma_score        * 0.9 +
+            structure_score * 1.0 +
+            oi_score        * 1.1 +
+            pcr_score       * 0.4
+        )
         score     = raw_score * adx_mult
         if score > 0: score += vol_bonus
         if score < 0: score -= vol_bonus
@@ -323,6 +489,10 @@ def compute_multi_rating(
             "breakdown": {
                 "oscillator_score":  round(osc_score, 3),
                 "ma_score":          round(ma_score, 3),
+                "oi_coverage":       oi_type,
+                "oi_score":          round(oi_score, 1),
+                "pcr_val":           round(pcr_val, 3),
+                "pcr_score":         round(pcr_score, 3),
                 "structure_orb":     orb_sig,
                 "adx":               round(adx_val, 1),
                 "adx_multiplier":    adx_mult,
@@ -335,6 +505,62 @@ def compute_multi_rating(
     except Exception as e:
         log.error(f"Multi-rating error: {e}")
         return {"score": 0, "rating": "NEUTRAL", "direction": "NONE", "breakdown": {}}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  OPTION GREEKS  (Black-Scholes, pure math — no scipy dependency)
+# ─────────────────────────────────────────────────────────────────────────────
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2)))
+
+def _norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+def compute_greeks(spot: float, strike: float, days_to_expiry: int,
+                   premium: float, opt_type: str = 'CE',
+                   risk_free: float = 0.065) -> dict:
+    """
+    Black-Scholes option greeks. IV estimated via Brenner-Subrahmanyam (1988).
+
+    Args:
+        spot            : Nifty spot price
+        strike          : Option strike price
+        days_to_expiry  : Calendar days to expiry
+        premium         : Current option premium (for IV estimation)
+        opt_type        : 'CE' or 'PE'
+        risk_free       : India risk-free rate (RBI repo ~6.5%)
+
+    Returns delta (abs), gamma, theta (daily decay ₹/unit), vega, iv_pct.
+    """
+    try:
+        T = max(days_to_expiry, 0.5) / 365.0   # min 12hr to avoid div/0
+
+        # Implied Volatility: Brenner-Subrahmanyam approximation
+        iv = (premium / max(spot, 1)) * math.sqrt(2 * math.pi / T)
+        iv = max(0.05, min(iv, 3.0))   # clamp 5%–300%
+
+        d1 = (math.log(spot / max(strike, 1)) + (risk_free + 0.5 * iv**2) * T) / (iv * math.sqrt(T))
+        d2 = d1 - iv * math.sqrt(T)
+
+        nd1 = _norm_cdf(d1);  nd2 = _norm_cdf(d2)
+        pd1 = _norm_pdf(d1)
+
+        delta = nd1 if opt_type == 'CE' else nd1 - 1.0
+        gamma = pd1 / max(spot * iv * math.sqrt(T), 1e-9)
+        theta = (-(spot * pd1 * iv) / (2 * math.sqrt(T))
+                 - risk_free * strike * math.exp(-risk_free * T)
+                 * (nd2 if opt_type == 'CE' else -_norm_cdf(-d2))) / 365.0
+        vega  = spot * pd1 * math.sqrt(T) / 100.0  # ₹ per 1% IV change
+
+        return {
+            'delta':  round(abs(delta), 3),
+            'gamma':  round(gamma, 5),
+            'theta':  round(theta, 2),     # negative = daily decay ₹
+            'vega':   round(vega, 2),
+            'iv_pct': round(iv * 100, 1),
+        }
+    except Exception:
+        return {'delta': 0.3, 'gamma': 0.001, 'theta': -5.0, 'vega': 1.0, 'iv_pct': 20.0}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

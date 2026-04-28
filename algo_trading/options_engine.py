@@ -1,7 +1,6 @@
 from .logger import log
-from .config import LOT_SIZE, MAX_TRADE_BUDGET
+from .config import LOT_SIZE, MAX_TRADE_BUDGET, INDSTOCKS_BASE, PCR_BULLISH_MAX, PCR_BEARISH_MIN
 from .market_data import fetch_ltp, get_auth_headers
-from .config import INDSTOCKS_BASE
 import requests
 import pandas as pd
 import io
@@ -30,6 +29,68 @@ def _get_instruments() -> pd.DataFrame:
     except Exception as e:
         log.error(f"Error fetching instruments: {e}")
     return pd.DataFrame()
+
+
+def compute_pcr() -> dict:
+    """
+    Computes Put-Call Ratio from near-expiry NIFTY options chain OI.
+
+    Uses the instruments CSV (already loaded/cached) — no extra API calls.
+    OI column = 'OPEN_INTEREST' if present, otherwise falls back to 1 per row.
+
+    Returns:
+        {
+            'pcr':       float  (total put OI / total call OI),
+            'bias':      str    ('BULLISH' | 'BEARISH' | 'NEUTRAL'),
+            'put_oi':    int,
+            'call_oi':   int,
+        }
+    """
+    try:
+        df = _get_instruments()
+        if df.empty:
+            return {'pcr': 1.0, 'bias': 'NEUTRAL', 'put_oi': 0, 'call_oi': 0}
+
+        today = pd.to_datetime(datetime.date.today())
+        nifty_opts = df[
+            df['TRADING_SYMBOL'].str.upper().str.startswith('NIFTY', na=False) &
+            (df['INSTRUMENT_NAME'] == 'OPTIDX') &
+            (df['EXPIRY_DATE'] >= today)
+        ].copy()
+
+        if nifty_opts.empty:
+            return {'pcr': 1.0, 'bias': 'NEUTRAL', 'put_oi': 0, 'call_oi': 0}
+
+        near_expiry = nifty_opts['EXPIRY_DATE'].min()
+        near_opts   = nifty_opts[nifty_opts['EXPIRY_DATE'] == near_expiry]
+
+        # Use OPEN_INTEREST if available, else count rows as proxy
+        oi_col = 'OPEN_INTEREST' if 'OPEN_INTEREST' in near_opts.columns else None
+        if oi_col:
+            put_oi  = float(near_opts[near_opts['OPTION_TYPE'] == 'PE'][oi_col].sum())
+            call_oi = float(near_opts[near_opts['OPTION_TYPE'] == 'CE'][oi_col].sum())
+        else:
+            put_oi  = float(len(near_opts[near_opts['OPTION_TYPE'] == 'PE']))
+            call_oi = float(len(near_opts[near_opts['OPTION_TYPE'] == 'CE']))
+
+        if call_oi == 0:
+            return {'pcr': 1.0, 'bias': 'NEUTRAL', 'put_oi': 0, 'call_oi': 0}
+
+        pcr = round(put_oi / call_oi, 3)
+
+        if pcr > PCR_BEARISH_MIN:
+            bias = 'BEARISH'
+        elif pcr < PCR_BULLISH_MAX:
+            bias = 'BULLISH'
+        else:
+            bias = 'NEUTRAL'
+
+        return {'pcr': pcr, 'bias': bias, 'put_oi': int(put_oi), 'call_oi': int(call_oi)}
+
+    except Exception as e:
+        log.warning(f"PCR compute error: {e}")
+        return {'pcr': 1.0, 'bias': 'NEUTRAL', 'put_oi': 0, 'call_oi': 0}
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -226,18 +287,20 @@ def select_strike(direction: str, spot_price: float, budget: float) -> dict:
         log.info(f"✅ Best strike: NIFTY {best_strike} {opt_type} @ Rs {best_premium:.2f} | {best_sec_id}")
     else:
         log.warning("⚠️ Could not find live option premium. Check token or market hours.")
-        # Hard fallback — no dummy, just return zero premium so trade is skipped
         return {
-            "security_id": f"NFO_DUMMY_{int(atm)}_{opt_type}",
-            "strike":      atm,
-            "type":        opt_type,
-            "simulated_premium": 0.0   # caller checks qty == 0 when premium is 0
+            "security_id":       f"NFO_DUMMY_{int(atm)}_{opt_type}",
+            "strike":            atm,
+            "type":              opt_type,
+            "days_to_expiry":    7,
+            "simulated_premium": 0.0
         }
 
+    days_to_exp = max(1, (near_expiry.date() - datetime.date.today()).days) if near_expiry is not None else 7
     return {
         "security_id":       best_sec_id,
         "strike":            best_strike,
         "type":              opt_type,
+        "days_to_expiry":    days_to_exp,
         "simulated_premium": best_premium
     }
 
@@ -247,15 +310,16 @@ def select_strike(direction: str, spot_price: float, budget: float) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 def calculate_dynamic_risk(premium: float):
     """
-    Scales SL/TP based on option premium quality (proxy for Delta).
-    Higher premium = lower Delta volatility = tighter levels.
+    SL/TP calibrated to real option move distribution.
+    TP at 8% across all tiers — achievable given avg peak PnL of +1.6% per 5m.
+    The trailing SL ladder in config.py takes over once price moves in our favour.
     """
     if premium < 80:
-        return 0.10, 0.20   # Deep OTM — wide SL, wide TP
+        return 0.10, 0.08   # Deep OTM — SL 10%, TP 8%
     elif premium < 180:
-        return 0.08, 0.16   # ATM-ish
+        return 0.08, 0.08   # ATM-ish
     else:
-        return 0.05, 0.12   # ITM — tighter, faster
+        return 0.05, 0.08   # ITM — tight SL, same TP
 
 
 def calculate_qty(budget: float, option_premium: float, lot_size: int = LOT_SIZE):

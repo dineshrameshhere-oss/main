@@ -6,14 +6,16 @@ from datetime import datetime, timezone, timedelta
 from .logger import log
 from .config import (TIME_PRE_MARKET, TIME_MARKET_OPEN, TIME_EOD_CHECK,
                      RATING_STRONG_BUY, RATING_STRONG_SELL,
-                     SUPERTREND_PERIOD, SUPERTREND_MULT, RSI_PERIOD)
+                     SUPERTREND_PERIOD, SUPERTREND_MULT, RSI_PERIOD,
+                     PCR_APPLY_AFTER_HOUR)
 from .market_data import (fetch_historical_ohlcv, compress_ohlcv_to_string,
                            fetch_first_30min_candle, fetch_intraday_data)
 from .news_fetcher import fetch_nifty_news
 from .indicators import (compute_key_levels, compute_supertrend, compute_adx_series,
-                          compute_macd_hist_series, compute_orb_series, compute_multi_rating)
+                          compute_macd_hist_series, compute_orb_series, compute_multi_rating,
+                          check_rv_gate, _candle_quality, _momentum_signal, compute_greeks)
 from .llm_analyst import analyze_premarket, analyze_market_open
-from .options_engine import select_strike, calculate_qty, calculate_dynamic_risk
+from .options_engine import select_strike, calculate_qty, calculate_dynamic_risk, compute_pcr
 from .trade_executor import place_order, get_balance, close_order
 from .risk_manager import monitor_position
 
@@ -31,6 +33,7 @@ class BotState:
         self.active_position_lock = threading.Lock()
         self.daily_trades:       int   = 0
         self.last_rating_score:  float = 0.0
+        self.last_breakdown:     dict  = {}
 
 state = BotState()
 
@@ -139,7 +142,9 @@ def _on_position_closed():
 # ─────────────────────────────────────────────────────────────────────────────
 #  TRADE EXECUTION
 # ─────────────────────────────────────────────────────────────────────────────
-def execute_scalp_trade(rating_score: float, direction: str):
+def execute_scalp_trade(rating_score: float, direction: str,
+                        df_enriched=None, pcr: dict | None = None):
+    """Enters a trade after passing all quality filters."""
     if state.daily_trades >= 3:
         log.warning("🚫 Max 3 trades/day reached.")
         return
@@ -149,18 +154,50 @@ def execute_scalp_trade(rating_score: float, direction: str):
         log.warning(f"⚠️ Balance ₹{current_balance:.2f} too low (need ≥ ₹1500).")
         return
 
-    df = _get_enriched_df()
+    # Use already-fetched df from poll — no double API call
+    df = df_enriched if (df_enriched is not None and not df_enriched.empty) else _get_enriched_df()
     if df is None or df.empty:
         log.error("❌ No live data for trade execution.")
         return
 
+    # ── 1. Candle Quality Filter (false breakout) ──────────────────────────
+    cq = _candle_quality(df, direction)
+    if cq['is_rejection']:
+        log.warning(f"⚠️ Candle rejected — {cq['reason']} | Skipping entry.")
+        return
+    log.info(f"  ✅ Candle quality OK (body {cq['body_ratio']:.0%})")
+
+    # ── 2. Momentum Filter ─────────────────────────────────────────────────
+    mom = _momentum_signal(df, direction)
+    if not mom['ok']:
+        log.warning(f"⚠️ Momentum weak — {mom['move_pct']:+.3f}% in 30 min "
+                    f"(need ≥{mom['required_pct']:.3f}%) | Skipping.")
+        return
+    log.info(f"  ✅ Momentum OK ({mom['move_pct']:+.3f}% in 30 min)")
+
+    # PCR is the 5th scoring component in compute_multi_rating (not a hard gate).
+    # It already influenced the STRONG_BUY/SELL crossover threshold.
+    if pcr:
+        log.info(f"  📊 PCR={pcr.get('pcr',1.0):.2f} ({pcr.get('bias','N/A')}) | included in composite score")
+
+    # ── 4. Strike selection ───────────────────────────────────────────────
     spot        = float(df['Close'].iloc[-1])
     strike_info = select_strike(direction, spot, current_balance)
     premium     = strike_info.get('simulated_premium', 0.0)
 
     if premium <= 0:
-        log.warning("⚠️ No valid live premium found — skipping trade.")
+        log.warning("⚠️ No valid live premium — skipping trade.")
         return
+
+    # ── 5. Greeks Gate (delta ≥ 0.20) ───────────────────────────────────────
+    opt_type    = 'CE' if direction == 'SCALP_LONG' else 'PE'
+    days_to_exp = strike_info.get('days_to_expiry', 7)
+    greeks      = compute_greeks(spot, strike_info['strike'], days_to_exp, premium, opt_type)
+    if greeks['delta'] < 0.20:
+        log.warning(f"⚠️ Greeks gate: delta={greeks['delta']:.3f} < 0.20 (too deep OTM) | Skipping.")
+        return
+    log.info(f"  ✅ Greeks — δ={greeks['delta']:.3f} γ={greeks['gamma']:.5f} "
+             f"θ={greeks['theta']:.1f}₹/day IV={greeks['iv_pct']:.0f}%")
 
     qty, cost, _ = calculate_qty(current_balance, premium)
     if qty == 0:
@@ -171,11 +208,14 @@ def execute_scalp_trade(rating_score: float, direction: str):
     sl_price = round(premium * (1 - sl_pct), 2)
     tp_price = round(premium * (1 + tp_pct), 2)
 
-    opt_type = 'CE' if direction == 'SCALP_LONG' else 'PE'
+    # OI coverage for log (from rating breakdown if available)
+    bd       = getattr(state, 'last_breakdown', {})
+    oi_type  = bd.get('oi_coverage', 'N/A')
     log.info(
         f"🎯 NIFTY {strike_info['strike']} {opt_type} | "
         f"Premium ₹{premium:.2f} | Qty {qty} | Cost ₹{cost:.0f} | "
-        f"SL ₹{sl_price:.2f} | TP ₹{tp_price:.2f} | Score {rating_score:+.2f}"
+        f"SL ₹{sl_price:.2f} | TP ₹{tp_price:.2f} | "
+        f"Score {rating_score:+.2f} | OI:{oi_type}"
     )
 
     order = place_order(
@@ -194,6 +234,7 @@ def execute_scalp_trade(rating_score: float, direction: str):
         args=(order, state.live_mode, _on_position_closed),
         daemon=True
     ).start()
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -226,22 +267,34 @@ def scalp_poll():
         log.warning("⚠️ [Poll] No live data. Retry next cycle.")
         return
 
+    # ── Realized Volatility Gate (skip flat days) ───────────────────────
+    rv = check_rv_gate(df)
+    if not rv['ok']:
+        log.info(f"[{now.strftime('%H:%M')}] ⏸️ RV gate: range {rv['range_pts']:.1f}pts "
+                 f"({rv['range_pct']:.2f}% < {rv['required']:.2f}% min) — flat session, skip")
+        return
+
+    # ── PCR (fetch once, reuse in execute) ─────────────────────────────
+    pcr_data = compute_pcr()
+
     window_df  = df.iloc[-50:].copy()
     rsi_window = window_df['RSI']
     adx_val    = float(df['ADX'].iloc[-1]) if not df['ADX'].isna().all() else 20.0
     macd_w     = window_df['MACD_HIST']
 
-    rating = compute_multi_rating(window_df, rsi_window, adx_val, macd_w)
+    rating = compute_multi_rating(window_df, rsi_window, adx_val, macd_w, pcr=pcr_data)
     score  = rating['score']
     bd     = rating['breakdown']
+    state.last_breakdown = bd   # stash for execute_scalp_trade OI log
 
     choppy_warn = " ⚠️CHOPPY" if bd.get('choppy') else ""
+    oi_type     = bd.get('oi_coverage', '')
+    pcr_txt     = f" PCR:{bd.get('pcr_val',1.0):.2f}" if 'pcr_val' in bd else ""
     log.info(
         f"[{now.strftime('%H:%M')}] 📊 {rating['rating']} ({score:+.2f}) | "
         f"ADX:{bd.get('adx',0):.0f}{choppy_warn} RSI:{bd.get('rsi',0):.0f} "
-        f"ORB:{bd.get('structure_orb',0):+.0f} "
-        f"Vol:{'✅' if bd.get('volume_confirm') else '❌'} "
-        f"Trades:{state.daily_trades}/3"
+        f"ORB:{bd.get('structure_orb',0):+.0f} OI:{oi_type}{pcr_txt} "
+        f"Vol:{'✅' if bd.get('volume_confirm') else '❌'} Trades:{state.daily_trades}/3"
     )
 
     prev_score            = state.last_rating_score
@@ -249,10 +302,10 @@ def scalp_poll():
 
     if score >= RATING_STRONG_BUY and prev_score < RATING_STRONG_BUY:
         log.info(f"🟢 STRONG BUY crossed +{RATING_STRONG_BUY} → Buy CE")
-        execute_scalp_trade(score, 'SCALP_LONG')
+        execute_scalp_trade(score, 'SCALP_LONG', df_enriched=df, pcr=pcr_data)
     elif score <= RATING_STRONG_SELL and prev_score > RATING_STRONG_SELL:
         log.info(f"🔴 STRONG SELL crossed {RATING_STRONG_SELL} → Buy PE")
-        execute_scalp_trade(score, 'SCALP_SHORT')
+        execute_scalp_trade(score, 'SCALP_SHORT', df_enriched=df, pcr=pcr_data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

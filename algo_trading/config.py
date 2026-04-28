@@ -57,12 +57,10 @@ SWING_RSI_BEAR_MAX   = 50
 
 # Risk Defaults (Aggressive for Scalping)
 DEFAULT_SL_PCT      = 0.10              # Initial hard SL: 10% of premium paid
-DEFAULT_TP_PCT      = 0.20             # Initial TP (overridden once trailing kicks in)
+DEFAULT_TP_PCT      = 0.08             # Initial TP: 8% (achievable — avg peak is +1.6% per trade)
 MAX_DAILY_LOSS_PCT  = 0.15              # Circuit breaker: stop trading if down 15% on the day
 
 # ── Multi-Indicator Rating Thresholds ────────────────────────────────────────
-# Based on TradingView Technical Ratings normalised score (-1 to +1 range)
-# We use a -3 to +3 range (3 category groups each contributing -1 to +1)
 RATING_STRONG_BUY   = 0.7    # score >= +0.7 → STRONG_BUY  (buy CE, full size)
 RATING_BUY          = 0.3    # score >= +0.3 → BUY         (buy CE)
 RATING_STRONG_SELL  = -0.7   # score <= -0.7 → STRONG_SELL (buy PE, full size)
@@ -71,23 +69,52 @@ VOLUME_MULT_SURGE   = 2.0    # Volume spike threshold for bonus score
 ADX_TREND_MIN       = 20     # ADX below this = choppy, halve all signals
 ADX_TREND_STRONG    = 25     # ADX above this = trending, normal signals
 
+# ── Realized Volatility Gate ──────────────────────────────────────────────────
+# Skip all entries on flat days — if Nifty hasn't moved enough, premiums won't.
+# Measured as High-Low range of last 12 bars (1 hour of 5m candles).
+# Using % of current price so it works regardless of data scale (1107 or 24000).
+# 0.3% of 24000 = 72 pts. 0.3% of 1107 = 3.3 pts. Both meaningful.
+MIN_NIFTY_HOURLY_RANGE_PCT = 0.003   # 0.3% of current price
+
+# ── PCR (Put-Call Ratio) Directional Gate ─────────────────────────────────────
+# Applied only after 11:00 AM (OI not meaningful before that).
+# Smart money positioning: PCR extreme = don't fight the flow.
+PCR_BULLISH_MAX = 0.70   # PCR below this = strong bullish OI → block PE entries
+PCR_BEARISH_MIN = 1.30   # PCR above this = strong bearish OI → block CE entries
+PCR_APPLY_AFTER_HOUR = 11  # IST hour after which PCR is reliable
+
+# ── Candle Quality (False Breakout Filter) ────────────────────────────────────
+# A doji or rejection candle at signal bar = probable fake breakout → skip trade.
+# Body ratio = candle body / total range. Low body ratio = indecision/rejection.
+CANDLE_MIN_BODY_RATIO = 0.20   # body must be ≥20% of candle range (20% = only blocks genuine dojis)
+CANDLE_REJECTION_WICK = 2.0    # wick-to-body ratio above which = rejection candle
+
+# ── Short-term Momentum Filter ────────────────────────────────────────────────
+# Require directional momentum BEFORE entry: price must be trending in signal dir.
+# Checked as: % net price move over last N bars.
+# 0.05% of 24000 = 12 pts. 0.05% of 1107 = 0.55 pts.
+# Works correctly regardless of underlying price scale.
+MOMENTUM_BARS       = 6     # look-back bars (6 × 5min = 30 min)
+MOMENTUM_MIN_MOVE_PCT = 0.0005  # 0.05% net move in signal direction over 30 min
+
 # ── Stepped Trailing SL Ladder ────────────────────────────────────────────────
-# Revised: starts at +5% (achievable even on lower-delta options)
+# Calibrated to actual option move distribution (avg peak +1.6%, max ~15%).
+# Starts locking gains at just +3% so even small moves are captured.
 # Each tuple: (profit_trigger_pct, locked_sl_floor_pct)
 # SL only moves UP — never down.
 TRAILING_STEPS = [
-    (0.05, 0.025),  # +5% profit   → lock in +2.5%  (min: covers ₹50 brokerage)
-    (0.10, 0.05),   # +10% profit  → lock in +5%
-    (0.20, 0.10),   # +20% profit  → lock in +10%
-    (0.30, 0.15),   # +30% profit  → lock in +15%
-    (0.40, 0.20),   # +40% profit  → lock in +20%
-    (0.50, 0.25),   # +50% profit  → lock in +25%
-    (0.60, 0.30),   # +60% profit  → lock in +30%
-    (0.70, 0.35),   # +70% profit  → lock in +35%
-    (0.80, 0.40),   # +80% profit  → lock in +40%
-    (0.90, 0.45),   # +90% profit  → lock in +45%
-    (1.00, 0.50),   # +100% profit → lock in +50%  (doubled money)
-    (1.50, 0.75),   # +150% profit → lock in +75%
+    (0.03, 0.015),  # +3%  profit → lock in +1.5%  (covers ₹50 brokerage on ₹2000 trade)
+    (0.05, 0.025),  # +5%  profit → lock in +2.5%
+    (0.08, 0.04),   # +8%  profit → lock in +4%    (TP hit zone — guarantee profit)
+    (0.10, 0.06),   # +10% profit → lock in +6%
+    (0.15, 0.08),   # +15% profit → lock in +8%
+    (0.20, 0.12),   # +20% profit → lock in +12%
+    (0.30, 0.18),   # +30% profit → lock in +18%
+    (0.40, 0.24),   # +40% profit → lock in +24%
+    (0.50, 0.30),   # +50% profit → lock in +30%
+    (0.75, 0.45),   # +75% profit → lock in +45%
+    (1.00, 0.60),   # +100% profit → lock in +60%
+    (1.50, 0.80),   # +150% profit → lock in +80%
     (2.00, 1.00),   # +200% profit → lock in +100% (full entry recovered)
 ]
 

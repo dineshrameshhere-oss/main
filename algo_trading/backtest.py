@@ -3,13 +3,14 @@ import time as _time
 from algo_trading.config import (
     EMA_FAST, EMA_SLOW, RSI_PERIOD,
     VOLUME_MULT_SCALP, SUPERTREND_PERIOD, SUPERTREND_MULT,
-    DEFAULT_SL_PCT, TRAILING_STEPS, RATING_STRONG_BUY, RATING_STRONG_SELL
+    DEFAULT_SL_PCT, DEFAULT_TP_PCT, TRAILING_STEPS, RATING_STRONG_BUY, RATING_STRONG_SELL
 )
 from algo_trading.market_data import get_auth_headers
 from algo_trading.config import INDSTOCKS_BASE, NIFTY_SCRIP_CODE
 from algo_trading.indicators import (
     compute_supertrend, compute_adx_series,
-    compute_macd_hist_series, compute_orb_series, compute_multi_rating
+    compute_macd_hist_series, compute_orb_series, compute_multi_rating,
+    check_rv_gate, _candle_quality, _momentum_signal
 )
 import numpy as np
 import requests
@@ -97,8 +98,7 @@ def calculate_rsi(series, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50)
 
-def run_backtest(initial_capital: float = 2000.0):
-    monthly_deposit = 2000.0   # keep topping up Rs 2000/month as before
+def run_backtest(initial_capital: float = 5000.0):
     print(f"Fetching 60 days of 5m Nifty data | Starting capital: Rs {initial_capital:.0f}")
     df = _fetch_5m_paginated(total_days=60, chunk_days=7)
 
@@ -164,28 +164,23 @@ def run_backtest(initial_capital: float = 2000.0):
     current_sl_pts         = 0.0
     current_tp_pts         = 0.0
     entry_bar_idx          = 0
-    MAX_HOLD_BARS          = 12    # 60-min max hold
+    MAX_HOLD_BARS          = 6     # 6 bars × 5min = 30-min max hold
     prev_rating_score      = 0.0   # for crossover detection
 
     # Capital simulation
     capital           = initial_capital
-    total_deposited   = initial_capital
     trades            = []
     daily_trades      = 0
     current_date      = None
-    start_date        = df.index[0].date()
-    last_deposit_date = start_date
+
+    # Filter skip counters (mutable list so nested loops can increment)
+    rv_skip_count  = [0]   # Realized Volatility gate skips
+    cq_skip_count  = [0]   # Candle Quality filter skips
+    mom_skip_count = [0]   # Momentum filter skips
 
     for i in range(50, len(df)):
         row = df.iloc[i]
         date = row.name.date()
-        
-        # Monthly deposit check (approx 30 days)
-        if (date - last_deposit_date).days >= 30:
-            capital         += monthly_deposit
-            total_deposited += monthly_deposit
-            last_deposit_date = date
-            print(f"[{date}] Monthly deposit +Rs {monthly_deposit:.0f} | Capital: Rs {capital:.2f}")
         
         if date != current_date:
             current_date = date
@@ -209,63 +204,60 @@ def run_backtest(initial_capital: float = 2000.0):
                 
         # 1. Manage Open Trade
         if in_trade:
-            est_delta    = min(0.8, max(0.2, current_premium_target / 300.0))
-            bars_held    = i - entry_bar_idx
+            est_delta = min(0.8, max(0.2, current_premium_target / 300.0))
+            bars_held = i - entry_bar_idx
 
-            # ── Stepped trailing: update SL floor based on premium peak ────────
+            # ── Compute bar's best PnL% in option-premium terms ───────────────
+            # Premium move ≈ Nifty move × delta / entry_premium
             if trade_dir == 1:
-                best_move = row['High'] - entry_price
+                best_nifty_move = row['High'] - entry_price
+                close_nifty_move = row['Close'] - entry_price
             else:
-                best_move = entry_price - row['Low']
-            bar_best_pnl_pct = (best_move * est_delta) / current_premium_target
+                best_nifty_move  = entry_price - row['Low']
+                close_nifty_move = entry_price - row['Close']
+
+            bar_best_pnl_pct  = (best_nifty_move  * est_delta) / max(current_premium_target, 1)
+            bar_close_pnl_pct = (close_nifty_move * est_delta) / max(current_premium_target, 1)
+
+            # Track peak (for trailing SL ratchet)
             if bar_best_pnl_pct > peak_pnl_pct:
                 peak_pnl_pct = bar_best_pnl_pct
                 sl_floor_pct = _stepped_sl_floor(peak_pnl_pct)
 
-            # ── Hard ATR-based levels (always apply) ───────────────────────────
-            # If trailing has raised the floor above original SL, use whichever
-            # is MORE protective (higher floor for LONG)
-            trailing_sl_pts = abs(sl_floor_pct) * current_premium_target / est_delta
-            effective_sl_pts = min(current_sl_pts, trailing_sl_pts) if sl_floor_pct < 0 \
-                               else trailing_sl_pts
+            # ── TP / SL checks in premium-% space ────────────────────────────
+            # TP: did this bar's best move hit DEFAULT_TP_PCT (8%)?
+            tp_hit = bar_best_pnl_pct >= DEFAULT_TP_PCT
 
+            # SL: worst move this bar in option terms
             if trade_dir == 1:
-                sl_price = entry_price - effective_sl_pts
-                tp_price = entry_price + current_tp_pts
-                sl_hit = row['Low']  <= sl_price
-                tp_hit = row['High'] >= tp_price
+                worst_nifty_move = entry_price - row['Low']
             else:
-                sl_price = entry_price + effective_sl_pts
-                tp_price = entry_price - current_tp_pts
-                sl_hit = row['High'] >= sl_price
-                tp_hit = row['Low']  <= tp_price
+                worst_nifty_move = row['High'] - entry_price
+            bar_worst_pnl_pct = -(worst_nifty_move * est_delta) / max(current_premium_target, 1)
 
-            exit_hit   = False
-            exit_price = 0
-            exit_pts   = 0
+            # Use trailing floor if active, else hard SL
+            effective_sl_pct = sl_floor_pct if sl_floor_pct > -DEFAULT_SL_PCT else -DEFAULT_SL_PCT
+            sl_hit = bar_worst_pnl_pct <= effective_sl_pct
+
+            exit_hit     = False
+            exit_pnl_pct = 0.0
 
             if tp_hit:
-                exit_hit = True; exit_price = tp_price
-                exit_pts = current_tp_pts
-                reason   = "TAKE_PROFIT"
+                exit_hit = True; exit_pnl_pct = DEFAULT_TP_PCT; reason = "TAKE_PROFIT"
             elif sl_hit:
-                exit_hit = True; exit_price = sl_price
-                exit_pts = -effective_sl_pts
-                reason   = "TRAILING_SL" if sl_floor_pct >= 0 else "HARD_SL"
+                exit_hit = True; exit_pnl_pct = effective_sl_pct
+                reason = "TRAILING_SL" if sl_floor_pct >= 0 else "HARD_SL"
 
-            # ── 45-min max hold: exit at current close ─────────────────────────
+            # ── 30-min max hold: exit at close-price pnl ─────────────────────
             if not exit_hit and bars_held >= MAX_HOLD_BARS:
-                exit_hit   = True
-                exit_price = row['Close']
-                exit_pts   = (row['Close'] - entry_price) * trade_dir
-                reason     = "TIME_EXIT"
+                exit_hit = True; exit_pnl_pct = bar_close_pnl_pct; reason = "TIME_EXIT"
 
             if exit_hit:
-                exit_pnl_inr = exit_pts * est_delta * 25
+                exit_pnl_inr = exit_pnl_pct * current_premium_target * 25
                 capital += exit_pnl_inr
                 trades.append({
                     "date": date, "type": "LONG" if trade_dir == 1 else "SHORT",
-                    "entry": entry_price, "exit": exit_price,
+                    "entry": entry_price, "exit": 0,
                     "pnl_inr": exit_pnl_inr, "capital": capital,
                     "premium": current_premium_target, "exit_reason": reason,
                     "peak_pnl_pct": round(peak_pnl_pct * 100, 1),
@@ -276,9 +268,9 @@ def run_backtest(initial_capital: float = 2000.0):
                 
             # EOD Force close at 15:15
             if in_trade and row.name.time().hour == 15 and row.name.time().minute >= 15:
-                exit_pnl_pts = (row['Close'] - entry_price) * trade_dir
-                est_delta    = min(0.8, max(0.2, current_premium_target / 300.0))
-                exit_pnl_inr = exit_pnl_pts * est_delta * 25
+                est_delta       = min(0.8, max(0.2, current_premium_target / 300.0))
+                close_nifty_pct = ((row['Close'] - entry_price) * trade_dir * est_delta) / max(current_premium_target, 1)
+                exit_pnl_inr    = close_nifty_pct * current_premium_target * 25
                 capital += exit_pnl_inr
                 trades.append({
                     "date": date, "type": "LONG" if trade_dir == 1 else "SHORT",
@@ -307,10 +299,9 @@ def run_backtest(initial_capital: float = 2000.0):
         # (handled inside compute_multi_rating — orb_sig=0 if before 9:45)
 
         premium_target = capital / 25.0
-        if premium_target < 20: continue   # < Rs 500 capital, skip
+        if premium_target < 20: continue
 
         # ── MULTI-INDICATOR RATING ────────────────────────────────────────────
-        # Use a rolling 50-bar window to give indicators enough history
         window_df   = df.iloc[max(0, i-50):i+1].copy()
         rsi_window  = window_df['RSI']
         adx_val     = float(row['ADX']) if not pd.isna(row['ADX']) else 20.0
@@ -319,28 +310,49 @@ def run_backtest(initial_capital: float = 2000.0):
         rating = compute_multi_rating(window_df, rsi_window, adx_val, macd_window)
         score  = rating['score']
 
-        # ── ENTRY: STRONG_BUY / STRONG_SELL only (highest confidence) ─────
-        # Crossover detection: score must CROSS the threshold this bar
+        # ── ENTRY: STRONG_BUY / STRONG_SELL crossover only ─────────────────
         new_long  = score >= RATING_STRONG_BUY  and prev_rating_score < RATING_STRONG_BUY
         new_short = score <= RATING_STRONG_SELL and prev_rating_score > RATING_STRONG_SELL
 
-        if new_long:
-            in_trade = True; trade_dir = 1    # BUY CE
-        elif new_short:
-            in_trade = True; trade_dir = -1   # BUY PE
+        if not new_long and not new_short:
+            prev_rating_score = score   # neutral bar — consume score normally
+            continue
 
-        if in_trade:
-            entry_price            = float(row['Close'])
-            daily_trades           += 1
-            current_premium_target = premium_target
-            entry_bar_idx          = i
-            peak_pnl_pct           = 0.0
-            sl_floor_pct           = -DEFAULT_SL_PCT
-            atr = float(row['ATR']) if not pd.isna(row['ATR']) else 3.0
-            current_sl_pts = max(atr * 2.5, 5.0)   # 2.5x ATR (~6.5 pts)
-            current_tp_pts = max(atr * 5.5, 12.0)  # 5.5x ATR (~14 pts) 2.2:1 R:R
+        direction = 'SCALP_LONG' if new_long else 'SCALP_SHORT'
 
+        # ── Filter 1: Realized Volatility Gate ─────────────────────────────
+        rv = check_rv_gate(window_df)
+        if not rv['ok']:
+            rv_skip_count[0] += 1
+            # DON'T update prev_rating_score — retry same crossover next bar
+            continue
+
+        # ── Filter 2: Candle Quality (false breakout) ───────────────────────
+        cq = _candle_quality(window_df, direction)
+        if cq['is_rejection']:
+            cq_skip_count[0] += 1
+            continue  # retry next bar
+
+        # ── Filter 3: Momentum (30-min directional move) ────────────────────
+        mom = _momentum_signal(window_df, direction)
+        if not mom['ok']:
+            mom_skip_count[0] += 1
+            continue  # retry next bar
+
+        # ── All filters passed — enter trade, consume crossover ─────────────
         prev_rating_score = score
+        in_trade   = True
+        trade_dir  = 1 if new_long else -1
+        entry_price            = float(row['Close'])
+        daily_trades           += 1
+        current_premium_target = premium_target
+        entry_bar_idx          = i
+        peak_pnl_pct           = 0.0
+        sl_floor_pct           = -DEFAULT_SL_PCT
+        atr = float(row['ATR']) if not pd.isna(row['ATR']) else 3.0
+        current_sl_pts = max(atr * 2.5, 5.0)   # 2.5× ATR SL
+        current_tp_pts = max(atr * 2.5, 6.0)   # 2.5× ATR TP (matches 8% option TP)
+
 
     # Analysis
     if not trades:
@@ -350,7 +362,6 @@ def run_backtest(initial_capital: float = 2000.0):
     wins = [t for t in trades if t['pnl_inr'] > 0]
     losses = [t for t in trades if t['pnl_inr'] <= 0]
     
-    total_inr      = capital - total_deposited
     trailing_exits = [t for t in trades if t.get('exit_reason') == 'TRAILING_SL']
     hard_sl_exits  = [t for t in trades if t.get('exit_reason') == 'HARD_SL']
     tp_exits       = [t for t in trades if t.get('exit_reason') == 'TAKE_PROFIT']
@@ -363,26 +374,31 @@ def run_backtest(initial_capital: float = 2000.0):
     avg_est_delta   = min(0.8, max(0.2, avg_premium / 300.0))
 
     print("\n" + "="*56)
-    print(f"  BACKTEST | Start: Rs {initial_capital:.0f} | Monthly +Rs {monthly_deposit:.0f}")
-    print("  Signal: Multi-Indicator Rating | STRONG_BUY/SELL only")
-    print("  Filters: No 9:15-9:30 | No 12:00-13:15 | No after 14:45")
+    print(f"  BACKTEST RESULTS (60 days) | Capital: Rs {initial_capital:.0f}")
+    print("  Signal : STRONG_BUY / STRONG_SELL only")
+    print("  Filters: Skip 9:15-9:30 | 12:00-13:15 | after 14:45")
+    print("  Guards : ADX<20 blocks STRONG | Vol confirm required")
     print("="*56)
-    print(f"  Option Quality: avg premium Rs {avg_premium:.0f}/unit | delta ~{avg_est_delta:.2f}")
-    print(f"  Total Trades     : {len(trades)}")
-    print(f"  Wins             : {len(wins)}  |  Losses: {len(losses)}")
-    print(f"  Win Rate         : {len(wins)/len(trades)*100:.1f}%")
-    print(f"  Avg Peak PnL%%   : +{avg_peak:.1f}%  (how far trades ran)")
-    print(f"  Avg Locked Floor : +{avg_floor:.1f}%  (avg profit locked on wins)")
-    print(f"  Hard SL exits    : {len(hard_sl_exits)}")
-    print(f"  Trailing SL exits: {len(trailing_exits)}")
-    print(f"  Take Profit hits : {len(tp_exits)}")
-    print(f"  Time exits (60m) : {len(time_exits)}")
-    print(f"  EOD exits        : {len(eod_exits)}")
+    print(f"  Option avg premium : Rs {avg_premium:.0f}/unit | delta ~{avg_est_delta:.2f}")
+    print(f"  Total Trades       : {len(trades)}")
+    print(f"  Wins               : {len(wins)}  |  Losses: {len(losses)}")
+    print(f"  Win Rate           : {len(wins)/len(trades)*100:.1f}%")
+    print(f"  Avg Peak PnL       : +{avg_peak:.1f}%  (how far trades ran before exit)")
+    print(f"  Avg Locked Floor   : +{avg_floor:.1f}%  (avg profit locked on wins)")
+    print(f"  Hard SL exits      : {len(hard_sl_exits)}")
+    print(f"  Trailing SL exits  : {len(trailing_exits)}")
+    print(f"  Take Profit hits   : {len(tp_exits)}")
+    print(f"  Time exits (60m)   : {len(time_exits)}")
+    print(f"  EOD exits          : {len(eod_exits)}")
     print("-"*56)
-    print(f"  Total Deposited  : Rs {total_deposited:.2f}")
-    print(f"  Final Capital    : Rs {capital:.2f}")
-    print(f"  Net PnL          : Rs {total_inr:.2f}")
-    print(f"  Return on Invest : {(total_inr/total_deposited)*100:.1f}%")
+    print(f"  Signals blocked by RV gate  : {rv_skip_count[0]}")
+    print(f"  Signals blocked by Candle Q : {cq_skip_count[0]}")
+    print(f"  Signals blocked by Momentum : {mom_skip_count[0]}")
+    print("-"*56)
+    print(f"  Started with       : Rs {initial_capital:.2f}")
+    print(f"  Ended with         : Rs {capital:.2f}")
+    print(f"  Net Trading PnL    : Rs {capital - initial_capital:+.2f}")
+    print(f"  Return             : {((capital - initial_capital) / initial_capital)*100:+.1f}%")
     print("="*56)
 
 if __name__ == "__main__":
