@@ -90,10 +90,11 @@ def get_balance(live: bool = False) -> float:
         return 0.0
         
     if not os.path.exists(PAPER_BALANCE_FILE):
-        # Initialize paper wallet with 2000
+        # Initialize paper wallet — default Rs 5000 or override via PAPER_INITIAL_BALANCE
+        initial = float(os.getenv('PAPER_INITIAL_BALANCE', '5000'))
         with open(PAPER_BALANCE_FILE, 'w') as f:
-            json.dump({"balance": 2000.0}, f)
-        return 2000.0
+            json.dump({"balance": initial}, f)
+        return initial
         
     with open(PAPER_BALANCE_FILE, 'r') as f:
         data = json.load(f)
