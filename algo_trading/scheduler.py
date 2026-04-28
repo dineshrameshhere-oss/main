@@ -5,12 +5,13 @@ from datetime import datetime, timezone, timedelta
 
 from .logger import log
 from .config import (
-    RATING_AFTERNOON_RELAXED, AFTERNOON_HOUR, AFTERNOON_MIN,TIME_PRE_MARKET, TIME_MARKET_OPEN, TIME_EOD_CHECK,
-                     RATING_STRONG_BUY, RATING_STRONG_SELL,
-                     SUPERTREND_PERIOD, SUPERTREND_MULT, RSI_PERIOD,
-                     PCR_APPLY_AFTER_HOUR)
+    RATING_AFTERNOON_RELAXED, AFTERNOON_HOUR, AFTERNOON_MIN,
+    TIME_PRE_MARKET, TIME_MARKET_OPEN, TIME_EOD_CHECK,
+    RATING_STRONG_BUY, RATING_STRONG_SELL,
+    SUPERTREND_PERIOD, SUPERTREND_MULT, RSI_PERIOD)
 from .market_data import (fetch_historical_ohlcv, compress_ohlcv_to_string,
-                           fetch_first_30min_candle, fetch_intraday_data)
+                           fetch_first_30min_candle, fetch_intraday_data,
+                           fetch_finnifty_direction)
 from .news_fetcher import fetch_nifty_news
 from .indicators import (compute_key_levels, compute_supertrend, compute_adx_series,
                           compute_macd_hist_series, compute_orb_series, compute_multi_rating,
@@ -274,10 +275,6 @@ def scalp_poll():
         return
 
     # ── Realized Volatility Gate (skip flat days) ───────────────────────
-    rv = check_rv_gate(df)
-    if not rv['ok']:
-        log.info(f"[{now.strftime('%H:%M')}] ⏸️ RV gate: range {rv['range_pts']:.1f}pts "
-                 f"({rv['range_pct']:.2f}% < {rv['required']:.2f}% min) — flat session, skip")
         return
 
     # ── PCR + FinNifty (fetch once per poll cycle) ───────────────────────
