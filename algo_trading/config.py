@@ -13,13 +13,19 @@ NIFTY_EXCHANGE    = "NSE"
 PRODUCT_TYPE      = "MARGIN"
 ALGO_ID           = "99999"
 
-# ── Afternoon Safety Net ──────────────────────────────────────────────────────
+# ── Scalping Bot Safety Net ───────────────────────────────────────────────────
 # If 0 trades by 12:30 IST, relax STRONG_BUY from 0.45 → 0.40 for afternoon.
-# Guarantees at least 1 entry opportunity per day without sacrificing quality.
-RATING_AFTERNOON_RELAXED = 0.40    # lower threshold applied after AFTERNOON_HOUR if no trades
-AFTERNOON_HOUR           = 12      # IST hour after which relaxation kicks in
-AFTERNOON_MIN            = 30      # IST minute
+RATING_AFTERNOON_RELAXED = 0.40    
+AFTERNOON_HOUR           = 12      
+AFTERNOON_MIN            = 30      
 
+# ── Intraday Deep Learning Bot Configuration ──────────────────────────────────
+INTRADAY_POLL_INTERVAL_MIN = 15          # Intraday runs on 15m candles
+INTRADAY_MAX_HOLD_MIN      = 240         # Hold for up to 4 hours (vs 1 hr scalp)
+INTRADAY_TP_PCT            = 40.0        # 40% target for multi-hour hold
+INTRADAY_SL_PCT            = -15.0       # 15% stop loss for wider swings
+INTRADAY_TSL_ACTIVATION    = 15.0        # Activate TSL at 15% profit
+INTRADAY_TSL_TRAIL         = 8.0         # Trail by 8%
 
 # Trading Constants
 LOT_SIZE          = 25                   # Nifty options lot size (updated to 25)
