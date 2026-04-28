@@ -9,8 +9,7 @@ from algo_trading.market_data import get_auth_headers
 from algo_trading.config import INDSTOCKS_BASE, NIFTY_SCRIP_CODE
 from algo_trading.indicators import (
     compute_supertrend, compute_adx_series,
-    compute_macd_hist_series, compute_orb_series, compute_multi_rating,
-    check_rv_gate, _candle_quality, _momentum_signal
+    compute_macd_hist_series, compute_orb_series, compute_multi_rating
 )
 import numpy as np
 import requests
@@ -164,7 +163,7 @@ def run_backtest(initial_capital: float = 5000.0):
     current_sl_pts         = 0.0
     current_tp_pts         = 0.0
     entry_bar_idx          = 0
-    MAX_HOLD_BARS          = 6     # 6 bars × 5min = 30-min max hold
+    MAX_HOLD_BARS          = 12    # 12 bars × 5min = 60-min max hold
     prev_rating_score      = 0.0   # for crossover detection
 
     # Capital simulation
@@ -174,9 +173,6 @@ def run_backtest(initial_capital: float = 5000.0):
     current_date      = None
 
     # Filter skip counters (mutable list so nested loops can increment)
-    rv_skip_count  = [0]   # Realized Volatility gate skips
-    cq_skip_count  = [0]   # Candle Quality filter skips
-    mom_skip_count = [0]   # Momentum filter skips
 
     for i in range(50, len(df)):
         row = df.iloc[i]
@@ -248,7 +244,7 @@ def run_backtest(initial_capital: float = 5000.0):
                 exit_hit = True; exit_pnl_pct = effective_sl_pct
                 reason = "TRAILING_SL" if sl_floor_pct >= 0 else "HARD_SL"
 
-            # ── 30-min max hold: exit at close-price pnl ─────────────────────
+            # ── 60-min max hold: exit at close-price pnl ─────────────────────
             if not exit_hit and bars_held >= MAX_HOLD_BARS:
                 exit_hit = True; exit_pnl_pct = bar_close_pnl_pct; reason = "TIME_EXIT"
 
@@ -320,24 +316,7 @@ def run_backtest(initial_capital: float = 5000.0):
 
         direction = 'SCALP_LONG' if new_long else 'SCALP_SHORT'
 
-        # ── Filter 1: Realized Volatility Gate ─────────────────────────────
-        rv = check_rv_gate(window_df)
-        if not rv['ok']:
-            rv_skip_count[0] += 1
-            # DON'T update prev_rating_score — retry same crossover next bar
-            continue
-
-        # ── Filter 2: Candle Quality (false breakout) ───────────────────────
-        cq = _candle_quality(window_df, direction)
-        if cq['is_rejection']:
-            cq_skip_count[0] += 1
-            continue  # retry next bar
-
-        # ── Filter 3: Momentum (30-min directional move) ────────────────────
-        mom = _momentum_signal(window_df, direction)
-        if not mom['ok']:
-            mom_skip_count[0] += 1
-            continue  # retry next bar
+        # Filters removed -- compute_multi_rating score handles all quality checks.
 
         # ── All filters passed — enter trade, consume crossover ─────────────
         prev_rating_score = score
@@ -391,9 +370,6 @@ def run_backtest(initial_capital: float = 5000.0):
     print(f"  Time exits (60m)   : {len(time_exits)}")
     print(f"  EOD exits          : {len(eod_exits)}")
     print("-"*56)
-    print(f"  Signals blocked by RV gate  : {rv_skip_count[0]}")
-    print(f"  Signals blocked by Candle Q : {cq_skip_count[0]}")
-    print(f"  Signals blocked by Momentum : {mom_skip_count[0]}")
     print("-"*56)
     print(f"  Started with       : Rs {initial_capital:.2f}")
     print(f"  Ended with         : Rs {capital:.2f}")

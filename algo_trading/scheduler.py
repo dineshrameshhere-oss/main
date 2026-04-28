@@ -13,7 +13,7 @@ from .market_data import (fetch_historical_ohlcv, compress_ohlcv_to_string,
 from .news_fetcher import fetch_nifty_news
 from .indicators import (compute_key_levels, compute_supertrend, compute_adx_series,
                           compute_macd_hist_series, compute_orb_series, compute_multi_rating,
-                          check_rv_gate, _candle_quality, _momentum_signal, compute_greeks)
+                          compute_greeks)
 from .llm_analyst import analyze_premarket, analyze_market_open
 from .options_engine import select_strike, calculate_qty, calculate_dynamic_risk, compute_pcr
 from .trade_executor import place_order, get_balance, close_order
@@ -189,15 +189,20 @@ def execute_scalp_trade(rating_score: float, direction: str,
         log.warning("⚠️ No valid live premium — skipping trade.")
         return
 
-    # ── 5. Greeks Gate (delta ≥ 0.20) ───────────────────────────────────────
+    # ── Greeks: score contribution (no hard gate) ──────────────────────────────
     opt_type    = 'CE' if direction == 'SCALP_LONG' else 'PE'
     days_to_exp = strike_info.get('days_to_expiry', 7)
     greeks      = compute_greeks(spot, strike_info['strike'], days_to_exp, premium, opt_type)
-    if greeks['delta'] < 0.20:
-        log.warning(f"⚠️ Greeks gate: delta={greeks['delta']:.3f} < 0.20 (too deep OTM) | Skipping.")
+    # Delta score: deep OTM options (delta<0.2) lower score but don't block
+    greek_bonus = 0.0
+    if   greeks['delta'] >= 0.45: greek_bonus = +0.08  # near ATM — good sensitivity
+    elif greeks['delta'] >= 0.30: greek_bonus = +0.03
+    elif greeks['delta'] <  0.15: greek_bonus = -0.10  # deep OTM — penalise
+    if rating_score + greek_bonus < RATING_STRONG_BUY * 0.90:
+        log.warning(f"⚠️ Greek penalty pulls score below threshold — δ={greeks['delta']:.3f} | Skipping.")
         return
     log.info(f"  ✅ Greeks — δ={greeks['delta']:.3f} γ={greeks['gamma']:.5f} "
-             f"θ={greeks['theta']:.1f}₹/day IV={greeks['iv_pct']:.0f}%")
+             f"θ={greeks['theta']:.1f}₹/day IV={greeks['iv_pct']:.0f}% greek_bonus={greek_bonus:+.2f}")
 
     qty, cost, _ = calculate_qty(current_balance, premium)
     if qty == 0:

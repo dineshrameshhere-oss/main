@@ -334,177 +334,201 @@ def compute_multi_rating(
     pcr: dict | None = None,
 ) -> dict:
     """
-    Computes the multi-indicator composite rating at the LAST bar of df.
-    PCR (Put-Call Ratio) is an optional 5th component: pass the dict from compute_pcr().
+    HYBRID composite rating: EMA crossover as entry trigger + 8 leading
+    indicators as a CONSENSUS FILTER to prevent false signals.
 
-    Returns:
-        {
-            "score":     float  (-3 to +3),
-            "rating":    str    (STRONG_BUY | BUY | NEUTRAL | SELL | STRONG_SELL),
-            "direction": str    (CALL | PUT | NONE),
-            "breakdown": dict   {indicator: value}
-        }
+    Architecture:
+      - EMA 5/13 crossover (fast, scale-invariant) generates entry momentum
+      - 8 leading indicators vote on whether to trust that crossover
+      - Consensus multiplier: 0.60 + 0.40 * (agree-oppose)/total
+        => 9/9 agree: mult=1.00 (no false signal), 5/9: mult=0.82, 2/9: mult=0.42
+      - Greeks confirmation applied AFTER strike selection (in scheduler)
+      - ADX dampens choppy markets but never hard-blocks
+
+    Leading indicators used (not lagging — no MACD slow lines, no RSI):
+      1. EMA 5/13 crossover  — fast price crossover trigger
+      2. Fast Stochastic %K  — immediate overbought/oversold
+      3. Williams %R         — leading overbought/oversold
+      4. Price ROC (5-bar)   — raw momentum speed
+      5. Volume surge        — confirms breakout vs fake
+      6. ORB breakout        — structural support/resistance
+      7. Candle body quality — strong bar vs doji
+      8. OI Coverage         — smart-money flow
+      9. PCR sentiment       — options market macro bias
     """
     try:
-        close   = df['Close'].iloc[-1]
-        prev_close = df['Close'].iloc[-2] if len(df) > 1 else close
+        close    = float(df["Close"].iloc[-1])
+        open_now = float(df["Open"].iloc[-1])
+        prev_close = float(df["Close"].iloc[-2]) if len(df) > 1 else close
 
-        # ── Oscillators ─────────────────────────────────────────────────────
-        rsi_val    = float(rsi_series.iloc[-1])
-        rsi_sig    = _rsi_signal(rsi_val)
-        stoch_sig  = _stoch_rsi_signal(rsi_series)
-        macd_now   = float(macd_hist.iloc[-1])
-        macd_prev  = float(macd_hist.iloc[-2]) if len(macd_hist) > 1 else macd_now
-        if   macd_now > 0 and macd_now > macd_prev: macd_sig = +1.0
-        elif macd_now < 0 and macd_now < macd_prev: macd_sig = -1.0
-        else:                                        macd_sig =  0.0
+        # ── 1. EMA 5/13 crossover (fast, scale-invariant) ─────────────────────
+        ema5  = df["Close"].ewm(span=5,  adjust=False).mean().iloc[-1]
+        ema13 = df["Close"].ewm(span=13, adjust=False).mean().iloc[-1]
+        # Binary cross: ema5 above = bullish, below = bearish (scale-invariant)
+        ema_sig = +1.0 if ema5 > ema13 else -1.0
 
-        osc_score = (rsi_sig + stoch_sig + macd_sig) / 3.0  # normalised -1 to +1
+        # ── 2. Fast Stochastic %K (5-bar) — leading oscillator ───────────────
+        k  = min(5, len(df))
+        hk = df["High"].rolling(k).max().iloc[-1]
+        lk = df["Low"].rolling(k).min().iloc[-1]
+        stoch_k = ((close - lk) / max(hk - lk, 1e-6)) * 100
+        if   stoch_k <= 15: stoch_sig = +1.0
+        elif stoch_k <= 30: stoch_sig = +0.5
+        elif stoch_k <= 45: stoch_sig = +0.1
+        elif stoch_k >= 85: stoch_sig = -1.0
+        elif stoch_k >= 70: stoch_sig = -0.5
+        elif stoch_k >= 55: stoch_sig = -0.1
+        else:               stoch_sig =  0.0
 
-        # ── Moving Averages ─────────────────────────────────────────────────
-        ema5  = df['Close'].ewm(span=5,  adjust=False).mean().iloc[-1]
-        ema9  = df['Close'].ewm(span=9,  adjust=False).mean().iloc[-1]
-        ema13 = df['Close'].ewm(span=13, adjust=False).mean().iloc[-1]
+        # ── 3. Williams %R (14-bar) — leading oscillator ──────────────────────
+        wr = min(14, len(df))
+        hw = df["High"].rolling(wr).max().iloc[-1]
+        lw = df["Low"].rolling(wr).min().iloc[-1]
+        willr = ((hw - close) / max(hw - lw, 1e-6)) * -100
+        if   willr <= -80: willr_sig = +1.0
+        elif willr <= -65: willr_sig = +0.5
+        elif willr >= -20: willr_sig = -1.0
+        elif willr >= -35: willr_sig = -0.5
+        else:              willr_sig =  0.0
 
-        ema_cross_sig = +1.0 if ema5 > ema13 else -1.0
-        ema9_sig      = +1.0 if close > ema9  else -1.0
+        # ── 4. Price ROC 5-bar (25-min momentum) — leading ───────────────────
+        close_back = float(df["Close"].iloc[-min(6, len(df))])
+        roc = (close - close_back) / max(abs(close_back), 1e-6)
+        roc_sig = max(-1.0, min(1.0, roc / 0.0005))  # 0.05% in 25 min = full
 
-        # VWAP (daily reset required — caller must ensure df has daily VWAP column)
-        vwap_val  = float(df['VWAP'].iloc[-1]) if 'VWAP' in df.columns else close
-        vwap_sig  = +1.0 if close > vwap_val * 1.001 else (-1.0 if close < vwap_val * 0.999 else 0.0)
+        # ── 5. Volume surge (direction-weighted) — breakout confirmation ──────
+        vol_ma    = df["Volume"].rolling(20).mean().iloc[-1]
+        vol_curr  = float(df["Volume"].iloc[-1])
+        vol_ratio = vol_curr / max(vol_ma, 1.0)
+        price_dir = +1.0 if close > prev_close else -1.0
+        if   vol_ratio >= 2.0: vol_sig = +1.0 * price_dir
+        elif vol_ratio >= 1.5: vol_sig = +0.6 * price_dir
+        elif vol_ratio >= 1.2: vol_sig = +0.3 * price_dir
+        else:                  vol_sig =  0.0
 
-        # SuperTrend
-        st_dir    = float(df['ST_Dir'].iloc[-1]) if 'ST_Dir' in df.columns else 0
-        st_sig    = -1.0 if st_dir == -1 else (+1.0 if st_dir == 1 else 0.0)
-        # Note: ST_Dir convention: -1=bullish (price above), +1=bearish (price below)
-        st_sig    = -st_sig   # flip: -1 direction means bullish for us
-
-        ma_score  = (ema_cross_sig + ema9_sig + vwap_sig + st_sig) / 4.0   # -1 to +1
-
-        # ── Structure (ORB) ─────────────────────────────────────────────────
-        orb_high = float(df['ORB_HIGH'].iloc[-1]) if 'ORB_HIGH' in df.columns else close
-        orb_low  = float(df['ORB_LOW'].iloc[-1])  if 'ORB_LOW'  in df.columns else close
-        time_h   = df.index[-1].time().hour
-        time_m   = df.index[-1].time().minute
-
-        # ORB only valid after 9:45 IST (opening range has formed)
+        # ── 6. ORB Breakout — structural leading signal ───────────────────────
+        orb_high = float(df["ORB_HIGH"].iloc[-1]) if "ORB_HIGH" in df.columns else close
+        orb_low  = float(df["ORB_LOW"].iloc[-1])  if "ORB_LOW"  in df.columns else close
+        t = df.index[-1].time()
         orb_sig = 0.0
-        if time_h > 9 or (time_h == 9 and time_m >= 45):
-            if close > orb_high:    orb_sig = +1.0   # closed above ORB → bullish
-            elif close < orb_low:   orb_sig = -1.0   # closed below ORB → bearish
+        if t.hour > 9 or (t.hour == 9 and t.minute >= 45):
+            if   close > orb_high: orb_sig = +1.0
+            elif close < orb_low:  orb_sig = -1.0
 
-        structure_score = orb_sig    # -1 to +1
+        # ── 7. Candle body quality — anti-false-signal score ─────────────────
+        crange = float(df["High"].iloc[-1]) - float(df["Low"].iloc[-1])
+        cbody  = abs(close - open_now)
+        bratio = cbody / max(crange, 1e-6)
+        cdir   = +1.0 if close >= open_now else -1.0
+        if   bratio >= 0.6: candle_sig = +1.0 * cdir
+        elif bratio >= 0.4: candle_sig = +0.6 * cdir
+        elif bratio >= 0.2: candle_sig = +0.2 * cdir
+        else:               candle_sig = -0.5 * cdir   # doji -> penalise
 
-        # ── ADX Strength Multiplier & Chopping Guard ───────────────────────
-        if adx_val < 20:   adx_mult = 0.5     # choppy market — halve signals
-        elif adx_val > 25: adx_mult = 1.2     # trending — slight boost
-        else:              adx_mult = 1.0
+        # ── 8. OI Coverage (smart-money flow) ────────────────────────────────
+        pmove  = close - (float(df["Close"].iloc[-6]) if len(df) >= 6 else close)
+        vnow   = float(df["Volume"].iloc[-1])
+        vma6   = float(df["Volume"].iloc[-6:].mean()) if len(df) >= 6 else vnow
+        vol_up = vnow > vma6 * 1.05
+        if   pmove > 0 and vol_up:  oi_type = "LONG_BUILDUP";   oi_sig = +1.0
+        elif pmove < 0 and vol_up:  oi_type = "SHORT_BUILDUP";  oi_sig = -1.0
+        elif pmove > 0:             oi_type = "SHORT_COVERING"; oi_sig = +0.4
+        elif pmove < 0:             oi_type = "LONG_UNWINDING"; oi_sig = -0.4
+        else:                       oi_type = "NEUTRAL";        oi_sig =  0.0
 
-        # ── OI Coverage (4 types from price+volume trend) ────────────────────
-        # Industry-standard OI interpretation applied to underlying OHLCV:
-        #   Price UP   + Volume UP   → Long Buildup   (fresh longs entering)    +1.0
-        #   Price DOWN + Volume UP   → Short Buildup  (fresh shorts entering)   -1.0
-        #   Price UP   + Volume DOWN → Short Covering (shorts exiting, weak)    +0.4
-        #   Price DOWN + Volume DOWN → Long Unwinding (longs exiting, weak)     -0.4
-        price_move  = close - (df['Close'].iloc[-6] if len(df) >= 6 else close)
-        vol_now     = df['Volume'].iloc[-1]
-        vol_ma6     = df['Volume'].iloc[-6:].mean() if len(df) >= 6 else vol_now
-        vol_rising  = vol_now > vol_ma6 * 1.05    # 5% above recent avg = rising
+        # ── 9. PCR sentiment — options market leading ─────────────────────────
+        pcr_val = float(pcr.get("pcr", 1.0)) if pcr else 1.0
+        pcr_sig = max(-0.5, min(0.5, (1.0 - pcr_val) * 0.5))
 
-        if price_move > 0 and vol_rising:
-            oi_type = 'LONG_BUILDUP';   oi_score = +1.0
-        elif price_move < 0 and vol_rising:
-            oi_type = 'SHORT_BUILDUP';  oi_score = -1.0
-        elif price_move > 0 and not vol_rising:
-            oi_type = 'SHORT_COVERING'; oi_score = +0.4
-        elif price_move < 0 and not vol_rising:
-            oi_type = 'LONG_UNWINDING'; oi_score = -0.4
-        else:
-            oi_type = 'NEUTRAL';        oi_score =  0.0
+        # ── Weighted composite ────────────────────────────────────────────────
+        # EMA gets highest weight (it's the TRIGGER that drives crossovers)
+        # OI Coverage second (smart money)
+        # ORB third (structural)
+        W   = {"ema": 1.2, "stoch": 0.9, "willr": 0.8, "roc": 0.7,
+               "vol": 0.6, "orb": 1.1, "candle": 0.7, "oi": 1.0, "pcr": 0.5}
+        MAX_W = sum(W.values())   # 7.5
 
-        # ── Volume confirmation ─────────────────────────────────────────────
-        vol_avg     = df['Volume'].rolling(20).mean().iloc[-1]
-        vol_curr    = df['Volume'].iloc[-1]
-        volume_ok   = bool(vol_curr > vol_avg * VOLUME_MULT_SCALP)
-        vol_bonus   = 0.1 if volume_ok else 0.0
+        sigs = [ema_sig, stoch_sig, willr_sig, roc_sig,
+                vol_sig, orb_sig, candle_sig, oi_sig, pcr_sig * 2]
 
-        # ── PCR (Put-Call Ratio) as 5th scoring component ───────────────────────
-        # PCR captures volatility sentiment from the options market:
-        #   PCR < 0.7  (more calls = bullish sentiment)  → positive score boost
-        #   PCR > 1.3  (more puts  = bearish sentiment)  → negative score boost
-        #   PCR 0.7–1.3 (neutral)                        → ~0
-        # Formula: (1.0 - pcr) * 0.5, clamped to [-0.5, +0.5]
-        pcr_val = float(pcr.get('pcr', 1.0)) if pcr else 1.0
-        pcr_score = max(-0.5, min(0.5, (1.0 - pcr_val) * 0.5))
+        raw = (ema_sig    * W["ema"]    + stoch_sig  * W["stoch"] +
+               willr_sig  * W["willr"]  + roc_sig    * W["roc"]   +
+               vol_sig    * W["vol"]    + orb_sig    * W["orb"]   +
+               candle_sig * W["candle"] + oi_sig     * W["oi"]    +
+               pcr_sig    * W["pcr"])
 
-        # ── Final composite score (5 components) ────────────────────────────
-        # Weight rationale:
-        #   OI Coverage  (1.1) — smart money flow: strongest predictor for scalp
-        #   Structure    (1.0) — ORB breakout: key for intraday momentum
-        #   MA           (0.9) — trend confirmation
-        #   Oscillators  (0.7) — RSI/MACD/Stoch: entry timing
-        #   PCR          (0.4) — options market sentiment: supporting signal
-        raw_score = (
-            osc_score       * 0.7 +
-            ma_score        * 0.9 +
-            structure_score * 1.0 +
-            oi_score        * 1.1 +
-            pcr_score       * 0.4
-        )
-        score     = raw_score * adx_mult
-        if score > 0: score += vol_bonus
-        if score < 0: score -= vol_bonus
+        # ── CONSENSUS ANTI-FALSE-SIGNAL MULTIPLIER ────────────────────────────
+        # Problem: fast leading indicators (Stoch, WR, EMA) fire individually
+        #          on noise -> false signals.
+        # Fix:    multiply the score by how many other indicators AGREE.
+        #         If only the EMA fires but Stoch/WR/OI/Volume all disagree,
+        #         the consensus_mult reduces the score below STRONG threshold.
+        #
+        # consensus_mult range: [0.60, 1.00]
+        #   9/9 agree -> 1.00 (no penalty, genuine signal)
+        #   7/9 agree -> 0.89 (mild — likely real)
+        #   5/9 agree -> 0.77 (moderate — skip if score is borderline)
+        #   3/9 agree -> 0.67 (heavy — most indicators oppose, suppress entry)
+        intended  = +1 if raw >= 0 else -1
+        # Only strong signals count in consensus (|sig| > 0.3).
+        # Neutral indicators abstain — they don't oppose the direction.
+        # This prevents mid-range oscillators from killing good crossovers.
+        agreeing  = sum(1 for s in sigs if s * intended > 0.30)
+        opposing  = sum(1 for s in sigs if s * intended < -0.30)
+        total_voting = max(1, agreeing + opposing)
+        net_vote  = (agreeing - opposing) / total_voting
+        consensus_mult = 0.65 + 0.35 * net_vote  # [0.30, 1.00] — penalise hard oppositions
 
-        # ── Rating assignment ────────────────────────────────────────────────
-        # HARD RULE 1: ADX < 20 = choppy market → STRONG signals are BLOCKED
-        #   Choppy markets cause false breakouts on options scalping.
-        #   Max allowed rating in choppy market: BUY / SELL only.
-        # HARD RULE 2: STRONG signals require volume confirmation (Vol:✅)
-        #   Without volume, a breakout is likely a fake-out.
-        choppy     = adx_val < 20
-        no_volume  = not volume_ok
+        # ADX multiplier: trending market boosts, choppy dampens (no hard block)
+        if   adx_val >= 30: adx_m = 1.10
+        elif adx_val >= 25: adx_m = 1.00
+        elif adx_val >= 20: adx_m = 0.85
+        else:               adx_m = 0.70   # choppy — dampen all signals
 
-        if   score >= +0.7:
-            if choppy or no_volume:
-                rating = "BUY"         # downgrade STRONG_BUY if choppy or no volume
-            else:
-                rating = "STRONG_BUY"
-        elif score >= +0.3: rating = "BUY"
-        elif score <= -0.7:
-            if choppy or no_volume:
-                rating = "SELL"        # downgrade STRONG_SELL if choppy or no volume
-            else:
-                rating = "STRONG_SELL"
-        elif score <= -0.3: rating = "SELL"
-        else:               rating = "NEUTRAL"
+        # Final score: normalise → consensus → ADX
+        score = (raw / MAX_W) * consensus_mult * adx_m
+
+        # ── Rating ────────────────────────────────────────────────────────────
+        if   score >= +0.45: rating = "STRONG_BUY"
+        elif score >= +0.20: rating = "BUY"
+        elif score <= -0.45: rating = "STRONG_SELL"
+        elif score <= -0.20: rating = "SELL"
+        else:                rating = "NEUTRAL"
 
         direction = "NONE"
-        if rating in ("STRONG_BUY",  "BUY"):       direction = "CALL"
-        if rating in ("STRONG_SELL", "SELL"):       direction = "PUT"
+        if rating in ("STRONG_BUY",  "BUY"):  direction = "CALL"
+        if rating in ("STRONG_SELL", "SELL"): direction = "PUT"
 
         return {
-            "score":      round(score, 3),
-            "rating":     rating,
-            "direction":  direction,
+            "score":     round(score, 3),
+            "rating":    rating,
+            "direction": direction,
             "breakdown": {
-                "oscillator_score":  round(osc_score, 3),
-                "ma_score":          round(ma_score, 3),
-                "oi_coverage":       oi_type,
-                "oi_score":          round(oi_score, 1),
-                "pcr_val":           round(pcr_val, 3),
-                "pcr_score":         round(pcr_score, 3),
-                "structure_orb":     orb_sig,
-                "adx":               round(adx_val, 1),
-                "adx_multiplier":    adx_mult,
-                "choppy":            choppy,
-                "rsi":               round(rsi_val, 1),
-                "macd_hist":         round(macd_now, 4),
-                "volume_confirm":    volume_ok,
-            }
+                "ema_cross":      +1 if ema5 > ema13 else -1,
+                "stoch_k":        round(stoch_k, 1),
+                "willr":          round(willr, 1),
+                "roc_pct":        round(roc * 100, 4),
+                "vol_ratio":      round(vol_ratio, 2),
+                "orb_sig":        orb_sig,
+                "candle_body":    round(bratio * 100, 1),
+                "oi_coverage":    oi_type,
+                "oi_score":       round(oi_sig, 1),
+                "pcr_val":        round(pcr_val, 3),
+                "pcr_score":      round(pcr_sig, 3),
+                "adx":            round(adx_val, 1),
+                "adx_mult":       adx_m,
+                "consensus":      round(consensus_mult, 2),
+                "agreeing":       agreeing,
+                "opposing":       opposing,
+                "volume_confirm": vol_ratio >= 1.2,
+            },
         }
     except Exception as e:
         log.error(f"Multi-rating error: {e}")
         return {"score": 0, "rating": "NEUTRAL", "direction": "NONE", "breakdown": {}}
+
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

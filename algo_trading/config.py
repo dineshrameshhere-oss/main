@@ -61,10 +61,10 @@ DEFAULT_TP_PCT      = 0.08             # Initial TP: 8% (achievable — avg peak
 MAX_DAILY_LOSS_PCT  = 0.15              # Circuit breaker: stop trading if down 15% on the day
 
 # ── Multi-Indicator Rating Thresholds ────────────────────────────────────────
-RATING_STRONG_BUY   = 0.7    # score >= +0.7 → STRONG_BUY  (buy CE, full size)
-RATING_BUY          = 0.3    # score >= +0.3 → BUY         (buy CE)
-RATING_STRONG_SELL  = -0.7   # score <= -0.7 → STRONG_SELL (buy PE, full size)
-RATING_SELL         = -0.3   # score <= -0.3 → SELL        (buy PE)
+RATING_STRONG_BUY   = 0.45   # score >= +0.45 → STRONG_BUY (calibrated to normalised leading score)
+RATING_BUY          = 0.2    # score >= +0.2 → BUY
+RATING_STRONG_SELL  = -0.45  # score <= -0.45 → STRONG_SELL
+RATING_SELL         = -0.2   # score <= -0.2 → SELL
 VOLUME_MULT_SURGE   = 2.0    # Volume spike threshold for bonus score
 ADX_TREND_MIN       = 20     # ADX below this = choppy, halve all signals
 ADX_TREND_STRONG    = 25     # ADX above this = trending, normal signals
