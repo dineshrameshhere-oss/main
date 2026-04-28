@@ -5,7 +5,7 @@ from algo_trading.config import (
     VOLUME_MULT_SCALP, SUPERTREND_PERIOD, SUPERTREND_MULT,
     DEFAULT_SL_PCT, DEFAULT_TP_PCT, TRAILING_STEPS, RATING_STRONG_BUY, RATING_STRONG_SELL
 )
-from algo_trading.market_data import get_auth_headers
+from algo_trading.market_data import get_auth_headers, fetch_nse_atm_premium
 from algo_trading.config import INDSTOCKS_BASE, NIFTY_SCRIP_CODE
 from algo_trading.indicators import (
     compute_supertrend, compute_adx_series,
@@ -172,6 +172,7 @@ def run_backtest(initial_capital: float = 5000.0):
     trades            = []
     daily_trades      = 0
     current_date      = None
+    daily_atm_premium = 200.0   # will be replaced by real bhavcopy each day
 
     # Filter skip counters (mutable list so nested loops can increment)
 
@@ -182,6 +183,15 @@ def run_backtest(initial_capital: float = 5000.0):
         if date != current_date:
             current_date = date
             daily_trades = 0
+            # ── Fetch today's real ATM premium from NSE Bhavcopy ──────────────
+            # direction determines CE or PE; for sizing we use CE as proxy
+            daily_atm_premium = fetch_nse_atm_premium(
+                trade_date=date,
+                api_spot=float(row['Close']),
+                opt_type='CE',
+                fallback=200.0,
+            )
+            print(f"  [{date}] ATM premium: Rs{daily_atm_premium:.0f}", end="\r", flush=True)
             # EOD day-boundary exit — use PREVIOUS bar's close (last bar of prior day)
             if in_trade:
                 prev_close   = df['Close'].iloc[i - 1]
@@ -295,17 +305,6 @@ def run_backtest(initial_capital: float = 5000.0):
         # Rule 4: ORB only valid after 9:44 — must wait for range to form
         # (handled inside compute_multi_rating — orb_sig=0 if before 9:45)
 
-        # ── Option premium: realistic fixed price (not capital-derived) ──────
-        # Nifty OTM CALL/PUT intraday: typical ₹150-250 depending on IV.
-        # API Nifty is scaled ~1107 (real ~24000), so delta/premium math stays
-        # in real-world terms. We use a fixed ₹200 ATM premium.
-        ATM_PREMIUM   = 200.0           # Rs per unit (realistic OTM intraday)
-        MAX_BUDGET    = min(capital * 0.30, 2000.0)   # risk max 30% or ₹2000
-        qty           = max(1, int(MAX_BUDGET / ATM_PREMIUM))
-        premium_target = ATM_PREMIUM
-        if premium_target * qty > capital:
-            continue   # not enough capital even for 1 unit
-
         # ── MULTI-INDICATOR RATING ────────────────────────────────────────────
         window_df   = df.iloc[max(0, i-50):i+1].copy()
         rsi_window  = window_df['RSI']
@@ -320,10 +319,20 @@ def run_backtest(initial_capital: float = 5000.0):
         new_short = score <= RATING_STRONG_SELL and prev_rating_score > RATING_STRONG_SELL
 
         if not new_long and not new_short:
-            prev_rating_score = score   # neutral bar — consume score normally
+            prev_rating_score = score
             continue
 
         direction = 'SCALP_LONG' if new_long else 'SCALP_SHORT'
+
+        # ── Option premium: from NSE Bhavcopy (real) or Rs200 fallback ──────
+        # ATM CE ≈ ATM PE at parity, so reuse daily_atm_premium for both sides.
+        # PE is fetched separately only if CE and PE diverge significantly.
+        ATM_PREMIUM  = daily_atm_premium          # already fetched at day boundary
+        MAX_BUDGET   = min(capital * 0.30, 2000.0)
+        qty          = max(1, int(MAX_BUDGET / ATM_PREMIUM))
+        premium_target = ATM_PREMIUM
+        if premium_target * qty > capital:
+            continue
 
         # ── All filters passed — enter trade ────────────────────────────────
         prev_rating_score = score

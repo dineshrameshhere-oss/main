@@ -1,8 +1,13 @@
 import pandas as pd
 import requests
 import os
+import io
+import zipfile
+import pathlib
+import datetime as _dt
 from .config import INDSTOCKS_BASE, NIFTY_SCRIP_CODE
 from .logger import log
+
 
 def get_auth_headers():
     token = os.getenv("INDSTOCKS_TOKEN", "")
@@ -388,3 +393,176 @@ def fetch_iv_rank() -> dict:
         # SILENT FAIL — poll cycle must never break because of IV fetch
         log.debug(f"IVR fetch skipped (non-critical): {ex}")
         return neutral
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  NSE FO BHAVCOPY — Real historical ATM option premiums (free, official)
+# ─────────────────────────────────────────────────────────────────────────────
+_BHAVCOPY_CACHE_DIR = pathlib.Path(__file__).parent.parent / "models" / "bhavcopy_cache"
+_MONTHS_SHORT = ["JAN","FEB","MAR","APR","MAY","JUN",
+                  "JUL","AUG","SEP","OCT","NOV","DEC"]
+
+# NSE archives User-Agent (required — NSE blocks bare requests)
+_NSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept":          "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer":         "https://www.nseindia.com/",
+    "Connection":      "keep-alive",
+}
+
+# Scale factor: converts API-scaled Nifty (~1107) → real Nifty (~24000)
+# Used only for ATM strike lookup in bhavcopy; does not affect P&L math.
+_API_SCALE = 24000.0 / 1107.0   # ≈ 21.68
+
+
+def _nearest_thursday(date: _dt.date) -> _dt.date:
+    """Return the nearest Thursday on or after `date` (weekly expiry day)."""
+    days_ahead = (3 - date.weekday()) % 7   # 3 = Thursday
+    return date + _dt.timedelta(days=days_ahead)
+
+
+def fetch_nse_atm_premium(
+    trade_date: _dt.date,
+    api_spot:   float,
+    opt_type:   str = "CE",
+    fallback:   float = 200.0,
+) -> float:
+    """
+    Returns the actual ATM Nifty option CLOSE premium from NSE FO Bhavcopy
+    for `trade_date`. Falls back to `fallback` (₹200) on any error.
+
+    Source: https://archives.nseindia.com/content/historical/DERIVATIVES/
+    Format: foDDMMMYYYYbhav.csv.zip  (e.g. fo28APR2026bhav.csv.zip)
+
+    Safety:
+      - Disk-cached in models/bhavcopy_cache/ — only downloads once per date
+      - Full try/except — never raises, never breaks the backtest loop
+      - 15-second timeout (generous for Termux mobile)
+    """
+    try:
+        _BHAVCOPY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+        # ── Cache key ─────────────────────────────────────────────────────────
+        cache_key  = f"{trade_date.strftime('%Y%m%d')}_{opt_type}.csv"
+        cache_file = _BHAVCOPY_CACHE_DIR / cache_key
+
+        if cache_file.exists():
+            df_opt = pd.read_csv(cache_file)
+        else:
+            # ── Build NSE archive URL (new format, verified 2025+) ────────────
+            # URL: nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_YYYYMMDD_F_0000.csv.zip
+            yyyymmdd = trade_date.strftime("%Y%m%d")
+            fname    = f"BhavCopy_NSE_FO_0_0_0_{yyyymmdd}_F_0000.csv"
+            url      = f"https://nsearchives.nseindia.com/content/fo/{fname}.zip"
+
+            resp = requests.get(url, headers=_NSE_HEADERS, timeout=15)
+            if resp.status_code != 200:
+                log.debug(f"Bhavcopy {trade_date}: HTTP {resp.status_code} from {url}")
+                return fallback
+
+            # ── Unzip → parse ─────────────────────────────────────────────────
+            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                csv_bytes = zf.read(fname)
+            df = pd.read_csv(io.StringIO(csv_bytes.decode("utf-8")))
+            df.columns = df.columns.str.strip()
+
+            # ── Detect column schema (new vs legacy NSE format) ───────────────
+            # New format cols: FinInstrmTp, TckrSymb, XpryDt, StrkPric, OptnTp, ClsPric ...
+            # Old format cols: INSTRUMENT, SYMBOL, EXPIRY_DT, STRIKE_PR, OPTION_TYP, CLOSE
+            is_new = "TckrSymb" in df.columns
+
+            if is_new:
+                inst_col   = "FinInstrmTp"
+                sym_col    = "TckrSymb"
+                expiry_col = "XpryDt"
+                strike_col = "StrkPric"
+                opttyp_col = "OptnTp"
+                close_col  = "ClsPric"
+                inst_val   = "OPTSTK"   # new format uses OPTSTK/OPTIDX differently
+                # Filter: NIFTY index options
+                df_opt = df[
+                    (df[sym_col].str.strip()    == "NIFTY") &
+                    (df[opttyp_col].str.strip() == opt_type)
+                ].copy()
+            else:
+                inst_col   = "INSTRUMENT"
+                sym_col    = "SYMBOL"
+                expiry_col = "EXPIRY_DT"
+                strike_col = "STRIKE_PR"
+                opttyp_col = "OPTION_TYP"
+                close_col  = "CLOSE"
+                df_opt = df[
+                    (df[inst_col].str.strip()   == "OPTIDX") &
+                    (df[sym_col].str.strip()     == "NIFTY")  &
+                    (df[opttyp_col].str.strip()  == opt_type)
+                ].copy()
+
+            if df_opt.empty:
+                log.debug(f"Bhavcopy {trade_date}: no NIFTY {opt_type} rows (is_new={is_new})")
+                return fallback
+
+            # Normalise column names for the rest of the function
+            df_opt = df_opt.rename(columns={
+                expiry_col: "EXPIRY_DT",
+                strike_col: "STRIKE_PR",
+                close_col:  "CLOSE",
+            })
+
+            # Cache normalised result
+            df_opt[["EXPIRY_DT", "STRIKE_PR", "CLOSE"]].to_csv(cache_file, index=False)
+
+        # ── Find nearest weekly expiry ─────────────────────────────────────────
+        df_opt = df_opt.copy()
+        df_opt["EXPIRY_DT"] = pd.to_datetime(
+            df_opt["EXPIRY_DT"], errors="coerce"   # ISO format YYYY-MM-DD, no dayfirst needed
+        )
+        nearest_thu = _nearest_thursday(trade_date)
+        week_df = df_opt[df_opt["EXPIRY_DT"].dt.date >= nearest_thu]
+        if week_df.empty:
+            week_df = df_opt[df_opt["EXPIRY_DT"].dt.date >= trade_date]
+        if week_df.empty:
+            return fallback
+
+        nearest_exp = week_df["EXPIRY_DT"].min()
+        week_df = week_df[week_df["EXPIRY_DT"] == nearest_exp].copy()
+
+        # ── Find ATM strike ────────────────────────────────────────────────────
+        real_spot = round(api_spot * _API_SCALE / 50) * 50
+        week_df["STRIKE_PR"] = pd.to_numeric(week_df["STRIKE_PR"], errors="coerce")
+        week_df["CLOSE"]     = pd.to_numeric(week_df["CLOSE"],     errors="coerce")
+        week_df["_dist"]     = (week_df["STRIKE_PR"] - real_spot).abs()
+        atm_row = week_df.nsmallest(1, "_dist")
+        if atm_row.empty:
+            return fallback
+
+        premium = float(atm_row.iloc[0]["CLOSE"])
+        # If premium < Rs5, it's an expiry-day worthless option — use next expiry
+        if premium < 5.0 or pd.isna(premium):
+            next_df = df_opt[df_opt["EXPIRY_DT"].dt.date > nearest_exp.date()]
+            if not next_df.empty:
+                next_exp    = next_df["EXPIRY_DT"].min()
+                next_week   = next_df[next_df["EXPIRY_DT"] == next_exp].copy()
+                next_week["STRIKE_PR"] = pd.to_numeric(next_week["STRIKE_PR"], errors="coerce")
+                next_week["CLOSE"]     = pd.to_numeric(next_week["CLOSE"],     errors="coerce")
+                next_week["_dist"]     = (next_week["STRIKE_PR"] - real_spot).abs()
+                atm_row = next_week.nsmallest(1, "_dist")
+                if not atm_row.empty:
+                    premium = float(atm_row.iloc[0]["CLOSE"])
+            if premium < 5.0 or pd.isna(premium):
+                return fallback
+
+        log.debug(
+            f"Bhavcopy {trade_date}: {opt_type} ATM={atm_row.iloc[0]['STRIKE_PR']:.0f} "
+            f"expiry={atm_row.iloc[0]['EXPIRY_DT']} close=Rs{premium:.1f} "
+            f"(real_spot~{real_spot:.0f})"
+        )
+        return premium
+
+    except Exception as ex:
+        log.debug(f"Bhavcopy fetch failed for {trade_date}: {ex}")
+        return fallback
