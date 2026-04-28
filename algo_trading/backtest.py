@@ -46,9 +46,11 @@ def _fetch_5m_paginated(total_days: int = 60, chunk_days: int = 7) -> pd.DataFra
                         'l':'Low','c':'Close','v':'Volume'
                     }, inplace=True)
                     # API returns UTC epoch seconds — convert to IST (UTC+5:30)
+                    from datetime import timezone, timedelta
+                    IST = timezone(timedelta(hours=5, minutes=30))
                     chunk['Date'] = (
                         pd.to_datetime(chunk['Timestamp'], unit='s', utc=True)
-                        .dt.tz_convert('Asia/Kolkata')
+                        .dt.tz_convert(IST)
                         .dt.tz_localize(None)          # strip tz-info for pandas compat
                     )
                     chunk.set_index('Date', inplace=True)

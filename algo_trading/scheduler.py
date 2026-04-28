@@ -38,10 +38,12 @@ def _get_enriched_df():
 
     # ── IST timezone fix ──────────────────────────────────────────────────
     if df.index.tzinfo is None:
+        from datetime import timezone, timedelta
+        IST = timezone(timedelta(hours=5, minutes=30))
         df.index = (
             pd.to_datetime(df.index, utc=True)
-            .tz_convert('Asia/Kolkata')
-            .tz_localize(None)
+            .tz_convert(IST)
+            .tz_localize(None)          # strip tz-info for pandas compat
         )
 
     # VWAP (daily reset)
