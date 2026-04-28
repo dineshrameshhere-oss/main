@@ -14,3 +14,37 @@
 [20:27:25] [WARNING] [93m[20:27:25] Not enough bars for ML inference: need 25, got 23[0m
 [20:27:25] [WARNING] [93m[20:27:25] Not enough bars for ML inference: need 25, got 24[0m
 [20:27:48] [INFO] [92m[20:27:48] ✅ ML models loaded from D:\algoTradingAntiGravity\models | 49 features[0m
+[21:36:08] [INFO] [92m[21:36:08] ✅ ML models loaded from D:\algoTradingAntiGravity\models | 49 features[0m
+[21:36:16] [WARNING] [93m[21:36:16] Not enough bars for ML inference: need 32, got 20[0m
+[21:36:16] [WARNING] [93m[21:36:16] Not enough bars for ML inference: need 32, got 21[0m
+[21:36:16] [WARNING] [93m[21:36:16] Not enough bars for ML inference: need 32, got 23[0m
+[21:36:16] [WARNING] [93m[21:36:16] Not enough bars for ML inference: need 32, got 24[0m
+[21:36:16] [WARNING] [93m[21:36:16] Not enough bars for ML inference: need 32, got 26[0m
+[21:36:16] [WARNING] [93m[21:36:16] Not enough bars for ML inference: need 32, got 27[0m
+[21:36:16] [WARNING] [93m[21:36:16] Not enough bars for ML inference: need 32, got 28[0m
+[21:36:16] [WARNING] [93m[21:36:16] Not enough bars for ML inference: need 32, got 29[0m
+[21:36:16] [WARNING] [93m[21:36:16] Not enough bars for ML inference: need 32, got 30[0m
+[21:36:16] [WARNING] [93m[21:36:16] Not enough bars for ML inference: need 32, got 31[0m
+[21:37:26] [INFO] [92m[21:37:26] ✅ ML models loaded from D:\algoTradingAntiGravity\models | 49 features[0m
+[21:38:26] [INFO] [92m[21:38:26] ✅ ML models loaded from D:\algoTradingAntiGravity\models | 49 features[0m
+[21:38:34] [WARNING] [93m[21:38:34] Not enough bars for ML inference: need 32, got 20[0m
+[21:38:34] [WARNING] [93m[21:38:34] Not enough bars for ML inference: need 32, got 21[0m
+[21:38:34] [WARNING] [93m[21:38:34] Not enough bars for ML inference: need 32, got 23[0m
+[21:38:34] [WARNING] [93m[21:38:34] Not enough bars for ML inference: need 32, got 24[0m
+[21:38:34] [WARNING] [93m[21:38:34] Not enough bars for ML inference: need 32, got 26[0m
+[21:38:34] [WARNING] [93m[21:38:34] Not enough bars for ML inference: need 32, got 27[0m
+[21:38:34] [WARNING] [93m[21:38:34] Not enough bars for ML inference: need 32, got 28[0m
+[21:38:34] [WARNING] [93m[21:38:34] Not enough bars for ML inference: need 32, got 29[0m
+[21:38:34] [WARNING] [93m[21:38:34] Not enough bars for ML inference: need 32, got 30[0m
+[21:38:34] [WARNING] [93m[21:38:34] Not enough bars for ML inference: need 32, got 31[0m
+[21:40:33] [INFO] [92m[21:40:33] ✅ ML models loaded from D:\algoTradingAntiGravity\models | 49 features[0m
+[21:40:41] [WARNING] [93m[21:40:41] Not enough bars for ML inference: need 32, got 20[0m
+[21:40:41] [WARNING] [93m[21:40:41] Not enough bars for ML inference: need 32, got 21[0m
+[21:40:41] [WARNING] [93m[21:40:41] Not enough bars for ML inference: need 32, got 23[0m
+[21:40:41] [WARNING] [93m[21:40:41] Not enough bars for ML inference: need 32, got 24[0m
+[21:40:41] [WARNING] [93m[21:40:41] Not enough bars for ML inference: need 32, got 26[0m
+[21:40:41] [WARNING] [93m[21:40:41] Not enough bars for ML inference: need 32, got 27[0m
+[21:40:41] [WARNING] [93m[21:40:41] Not enough bars for ML inference: need 32, got 28[0m
+[21:40:41] [WARNING] [93m[21:40:41] Not enough bars for ML inference: need 32, got 29[0m
+[21:40:41] [WARNING] [93m[21:40:41] Not enough bars for ML inference: need 32, got 30[0m
+[21:40:41] [WARNING] [93m[21:40:41] Not enough bars for ML inference: need 32, got 31[0m

@@ -66,49 +66,51 @@ LAG_BARS = 10   # must match ml_trainer.LAG_BARS
 
 def _build_live_features(df: pd.DataFrame) -> pd.DataFrame | None:
     """
-    Given a OHLCV DataFrame of the last N 15m bars, builds the same feature
-    vector that was used during training. Returns a single-row DataFrame.
+    Builds the same feature vector used during training.
+    Requires 35+ bars: vol_ratio needs 20-bar MA + 10 lag bars + 5 buffer.
     """
-    if len(df) < LAG_BARS + 15:
-        log.warning(f"Not enough bars for ML inference: need {LAG_BARS + 15}, got {len(df)}")
+    MIN_BARS = LAG_BARS + 22   # 32 bars: covers vol_ratio(20) + lag10 + buffer
+    if len(df) < MIN_BARS:
+        log.warning(f"Not enough bars for ML inference: need {MIN_BARS}, got {len(df)}")
         return None
 
-    d = df.copy()
+    # Use only the most recent 120 bars to keep inference fast
+    d = df.tail(120).copy()
 
     # Base features (scale-invariant)
     d["close_pct"]    = d["Close"].pct_change() * 100
     d["high_low_pct"] = (d["High"] - d["Low"]) / d["Close"].shift(1) * 100
-    d["vol_ratio"]    = d["Volume"] / d["Volume"].rolling(20).mean().replace(0, 1)
+    d["vol_ratio"]    = d["Volume"] / d["Volume"].rolling(20, min_periods=5).mean().replace(0, 1)
 
     tr = pd.concat([
         (d["High"] - d["Low"]),
         (d["High"] - d["Close"].shift(1)).abs(),
         (d["Low"]  - d["Close"].shift(1)).abs()
     ], axis=1).max(axis=1)
-    d["atr_pct"] = tr.rolling(14).mean() / d["Close"] * 100
+    d["atr_pct"]   = tr.rolling(14, min_periods=3).mean() / d["Close"] * 100
 
     delta = d["Close"].diff()
-    gain  = delta.clip(lower=0).rolling(14).mean()
-    loss  = (-delta.clip(upper=0)).rolling(14).mean().replace(0, 1e-9)
-    d["rsi"] = 100 - (100 / (1 + gain / loss))
-    d["adx_proxy"] = tr.rolling(14).mean() / d["Close"] * 1000
+    gain  = delta.clip(lower=0).rolling(14, min_periods=3).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14, min_periods=3).mean().replace(0, 1e-9)
+    d["rsi"]       = 100 - (100 / (1 + gain / loss))
+    d["adx_proxy"] = tr.rolling(14, min_periods=3).mean() / d["Close"] * 1000
 
     d["hour"]    = d.index.hour
     d["minute"]  = d.index.minute
     d["weekday"] = d.index.dayofweek
 
-    # Lag features
+    # Lag features — forward-fill first so early-window NaNs don't propagate
+    d.ffill(inplace=True)
     for lag in range(1, LAG_BARS + 1):
         d[f"cp_lag{lag}"]  = d["close_pct"].shift(lag)
         d[f"vr_lag{lag}"]  = d["vol_ratio"].shift(lag)
         d[f"rsi_lag{lag}"] = d["rsi"].shift(lag)
         d[f"hl_lag{lag}"]  = d["high_low_pct"].shift(lag)
 
-    d.dropna(inplace=True)
+    d.dropna(subset=_feature_cols, inplace=True)
     if d.empty:
         return None
 
-    # Use the last row (current bar)
     row = d.iloc[[-1]][_feature_cols]
     return row
 

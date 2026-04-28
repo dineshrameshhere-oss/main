@@ -21,7 +21,7 @@ AFTERNOON_MIN            = 30
 
 # ── Intraday Deep Learning Bot Configuration ──────────────────────────────────
 INTRADAY_POLL_INTERVAL_MIN = 15          # Intraday runs on 15m candles
-INTRADAY_MAX_HOLD_MIN      = 240         # Hold for up to 4 hours (vs 1 hr scalp)
+INTRADAY_MAX_HOLD_MIN      = 120         # Hold for up to 2 hours (8 bars × 15m)
 INTRADAY_TP_PCT            = 40.0        # 40% target for multi-hour hold
 INTRADAY_SL_PCT            = -15.0       # 15% stop loss for wider swings
 INTRADAY_TSL_ACTIVATION    = 15.0        # Activate TSL at 15% profit

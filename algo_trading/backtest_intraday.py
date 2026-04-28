@@ -112,67 +112,65 @@ def run_intraday_backtest(initial_capital=5000.0, days=60):
         # ── 1. Manage Active Position ─────────────────────────────────────────
         if position:
             position['bars_held'] += 1
-            entry       = position['entry_price']
             entry_spot  = position['entry_spot']
-            
-            # Option P&L simulation (scale-invariant):
-            # Nifty % move × delta × ATM premium (₹180) = option price change
-            # delta=0.55 for OTM intraday buys
-            nifty_move_pct = (current_bar['Close'] - entry_spot) / max(abs(entry_spot), 1e-6)
+
+            # Scale-invariant P&L: use % move of Nifty directly
+            # Works correctly whether API returns 1107 or 24000
+            nifty_move_pct = (current_bar['Close'] - entry_spot) / max(abs(entry_spot), 1e-9) * 100
             if position['direction'] == 'PUT':
                 nifty_move_pct = -nifty_move_pct
 
-            # Intraday ATM Nifty option: ₹180 premium, lot 25
-            # A 1% Nifty move with delta 0.55 → option moves ~0.55% of underlying
-            # expressed as % of premium: (nifty_move_pct × 24000 × 0.55) / 180
-            REAL_NIFTY    = 24000.0   # approximate real Nifty level for option delta scaling
-            ATM_PREMIUM   = 180.0
-            DELTA         = 0.55
-            option_move   = nifty_move_pct * REAL_NIFTY * DELTA
-            est_option_price = ATM_PREMIUM + option_move
-            pnl_pct = ((est_option_price - ATM_PREMIUM) / ATM_PREMIUM) * 100
+            # Scale-invariant P&L using trade_cost (30% of capital)
+            # At ATM with delta=0.55: a 1% Nifty move = 73% option P&L
+            # leverage_factor = (REAL_NIFTY × DELTA) / ATM_PREMIUM = 24000×0.55/180 = 73.3
+            NIFTY_SL_PCT      = -0.50   # -0.5% Nifty → -36% option P&L
+            NIFTY_TP_PCT      =  1.00   # +1.0% Nifty → +73% option P&L
+            LEVERAGE          = (24000.0 * 0.55) / 180.0   # ~73.3
+            trade_cost        = position['trade_cost']
+            # P&L in Rs proportional to amount risked
+            option_pnl_rs     = (nifty_move_pct / 100) * LEVERAGE * trade_cost
 
-            
             # SL hit
-            if pnl_pct <= INTRADAY_SL_PCT:
-                capital += (est_option_price - entry) * LOT_SIZE
+            if nifty_move_pct <= NIFTY_SL_PCT:
+                capital += option_pnl_rs
                 position['exit_reason'] = "STOP_LOSS"
-                position['pnl'] = pnl_pct
+                position['pnl_nifty_pct'] = round(nifty_move_pct, 3)
                 trades.append(position)
                 losses += 1
                 position = None
                 continue
-                
+
             # TP hit
-            if pnl_pct >= INTRADAY_TP_PCT:
-                capital += (est_option_price - entry) * LOT_SIZE
+            if nifty_move_pct >= NIFTY_TP_PCT:
+                capital += option_pnl_rs
                 position['exit_reason'] = "TAKE_PROFIT"
-                position['pnl'] = pnl_pct
+                position['pnl_nifty_pct'] = round(nifty_move_pct, 3)
                 trades.append(position)
                 wins += 1
                 position = None
                 continue
-                
-            # Time limit
+
+            # Time limit (4h = 16 bars of 15m)
             if position['bars_held'] >= max_hold_bars:
-                capital += (est_option_price - entry) * LOT_SIZE
+                capital += option_pnl_rs
                 position['exit_reason'] = "TIME_LIMIT"
-                position['pnl'] = pnl_pct
+                position['pnl_nifty_pct'] = round(nifty_move_pct, 3)
                 trades.append(position)
-                if pnl_pct > 0: wins += 1
+                if nifty_move_pct > 0: wins += 1
                 else: losses += 1
                 position = None
                 continue
-                
+
             # EOD exit
             if bar_time.hour == 15 and bar_time.minute >= 15:
-                capital += (est_option_price - entry) * LOT_SIZE
+                capital += option_pnl_rs
                 position['exit_reason'] = "EOD"
-                position['pnl'] = pnl_pct
+                position['pnl_nifty_pct'] = round(nifty_move_pct, 3)
                 trades.append(position)
-                if pnl_pct > 0: wins += 1
+                if nifty_move_pct > 0: wins += 1
                 else: losses += 1
                 position = None
+
                 continue
                 
             continue
@@ -195,15 +193,20 @@ def run_intraday_backtest(initial_capital=5000.0, days=60):
         if rating['direction'] == "NONE":
             continue
 
-        mock_premium = 180.0
-        if mock_premium * LOT_SIZE > capital:
-            continue  # not enough capital
+        # Risk 30% of capital per intraday trade (manageable for small account)
+        # ₹5000 × 0.30 = ₹1,500 per trade
+        RISK_PCT      = 0.30
+        trade_cost    = capital * RISK_PCT
+        mock_premium  = 180.0
+        if trade_cost < mock_premium:
+            continue  # not even ₹180 left
 
         position = {
             'entry_time':  current_bar.name,
             'direction':   rating['direction'],
             'entry_spot':  current_bar['Close'],
             'entry_price': mock_premium,
+            'trade_cost':  trade_cost,
             'bars_held':   0,
             'score':       rating['score'],
             'rating':      rating['rating'],
