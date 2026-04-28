@@ -76,7 +76,7 @@ ADX_TREND_STRONG    = 25     # ADX above this = trending, normal signals
 # Each tuple: (profit_trigger_pct, locked_sl_floor_pct)
 # SL only moves UP — never down.
 TRAILING_STEPS = [
-    (0.05, 0.02),   # +5% profit   → lock in +2%   (breakeven-ish)
+    (0.05, 0.025),  # +5% profit   → lock in +2.5%  (min: covers ₹50 brokerage)
     (0.10, 0.05),   # +10% profit  → lock in +5%
     (0.20, 0.10),   # +20% profit  → lock in +10%
     (0.30, 0.15),   # +30% profit  → lock in +15%
@@ -90,3 +90,7 @@ TRAILING_STEPS = [
     (1.50, 0.75),   # +150% profit → lock in +75%
     (2.00, 1.00),   # +200% profit → lock in +100% (full entry recovered)
 ]
+
+# Brokerage + API cost per round-trip (buy + sell)
+# INDMoney: ₹20 flat × 2 sides = ₹40  |  API/exchange: ~₹10
+BROKERAGE_PER_TRADE = 50.0   # Rs  (used to enforce min floor covers costs)

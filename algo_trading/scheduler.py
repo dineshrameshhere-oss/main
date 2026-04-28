@@ -1,189 +1,234 @@
 import schedule
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from .logger import log
-from .config import TIME_PRE_MARKET, TIME_MARKET_OPEN, TIME_EOD_CHECK
-from .market_data import fetch_historical_ohlcv, compress_ohlcv_to_string, fetch_first_30min_candle, fetch_intraday_data
+from .config import (TIME_PRE_MARKET, TIME_MARKET_OPEN, TIME_EOD_CHECK,
+                     RATING_STRONG_BUY, RATING_STRONG_SELL,
+                     SUPERTREND_PERIOD, SUPERTREND_MULT, RSI_PERIOD)
+from .market_data import (fetch_historical_ohlcv, compress_ohlcv_to_string,
+                           fetch_first_30min_candle, fetch_intraday_data)
 from .news_fetcher import fetch_nifty_news
-from .indicators import compute_key_levels, compute_scalp_signals, compute_supertrend, compute_adx_series, compute_macd_hist_series, compute_orb_series, compute_multi_rating
+from .indicators import (compute_key_levels, compute_supertrend, compute_adx_series,
+                          compute_macd_hist_series, compute_orb_series, compute_multi_rating)
 from .llm_analyst import analyze_premarket, analyze_market_open
 from .options_engine import select_strike, calculate_qty, calculate_dynamic_risk
-from .trade_executor import place_order, get_balance
+from .trade_executor import place_order, get_balance, close_order
 from .risk_manager import monitor_position
-from .config import RATING_STRONG_BUY, RATING_STRONG_SELL, SUPERTREND_PERIOD, SUPERTREND_MULT, RSI_PERIOD
 
-# Global state
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  BOT STATE  (single shared instance — no class-level mutable defaults)
+# ─────────────────────────────────────────────────────────────────────────────
 class BotState:
-    premarket_analysis = {}
-    live_mode = False
-    active_position = None
-    daily_trades = 0
-    last_rating_score = 0.0   # for crossover detection
+    def __init__(self):
+        self.premarket_analysis: dict  = {}
+        self.live_mode:          bool  = False
+        self.active_position:    dict | None = None
+        self.active_position_lock = threading.Lock()
+        self.daily_trades:       int   = 0
+        self.last_rating_score:  float = 0.0
 
 state = BotState()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  LIVE DATA HELPER
+# ─────────────────────────────────────────────────────────────────────────────
 def _get_enriched_df():
-    """Fetch live 5m data and attach all indicator columns needed by compute_multi_rating."""
+    """Fetch 5m intraday data and compute all indicator columns."""
     import pandas as pd
-    import numpy as np
 
     df = fetch_intraday_data(interval='5minute', days_back=2)
     if df is None or df.empty:
         return None
 
     df = df.dropna()
+    if len(df) < 30:
+        log.warning("Enriched DF too short (<30 bars). Skipping.")
+        return None
 
-    # ── IST timezone fix ──────────────────────────────────────────────────
+    # IST conversion (no tzdata needed)
     if df.index.tzinfo is None:
-        from datetime import timezone, timedelta
-        IST = timezone(timedelta(hours=5, minutes=30))
         df.index = (
             pd.to_datetime(df.index, utc=True)
             .tz_convert(IST)
-            .tz_localize(None)          # strip tz-info for pandas compat
+            .tz_localize(None)
         )
 
     # VWAP (daily reset)
     df['TradeDate'] = df.index.date
-    tp  = (df['High'] + df['Low'] + df['Close']) / 3
-    df['VWAP'] = (tp * df['Volume']).groupby(df['TradeDate']).cumsum() / \
-                  df['Volume'].groupby(df['TradeDate']).cumsum()
+    tp = (df['High'] + df['Low'] + df['Close']) / 3
+    df['VWAP'] = (
+        (tp * df['Volume']).groupby(df['TradeDate']).cumsum()
+        / df['Volume'].groupby(df['TradeDate']).cumsum()
+    )
 
-    # SuperTrend
-    df['ST_Dir'] = compute_supertrend(df, period=SUPERTREND_PERIOD, mult=SUPERTREND_MULT)
-
-    # ADX
-    df['ADX'] = compute_adx_series(df, period=14)
-
-    # MACD histogram
+    df['ST_Dir']    = compute_supertrend(df, period=SUPERTREND_PERIOD, mult=SUPERTREND_MULT)
+    df['ADX']       = compute_adx_series(df, period=14)
     df['MACD_HIST'] = compute_macd_hist_series(df)
 
-    # RSI (Wilder)
     rsi_delta = df['Close'].diff()
     rsi_gain  = rsi_delta.where(rsi_delta > 0, 0).ewm(com=RSI_PERIOD-1, adjust=False).mean()
     rsi_loss  = (-rsi_delta.where(rsi_delta < 0, 0)).ewm(com=RSI_PERIOD-1, adjust=False).mean()
     df['RSI'] = (100 - (100 / (1 + rsi_gain / rsi_loss.replace(0, 1e-9)))).fillna(50)
 
-    # ORB
     df = compute_orb_series(df)
-
     return df
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  SCHEDULED JOBS
+# ─────────────────────────────────────────────────────────────────────────────
 def job_premarket():
-    log.info("\n[09:00] 📊 Fetching pre-market data and news...")
-    historical = fetch_historical_ohlcv()
+    log.info("\n[09:00] 📊 Pre-market scan starting...")
+    try:
+        historical = fetch_historical_ohlcv()
+        df_1h      = historical.get('1h')
+        key_levels = compute_key_levels(df_1h)
+        comp_1h    = compress_ohlcv_to_string(df_1h, '1h')
+        news       = fetch_nifty_news()
 
-    df_1h = historical.get('1h')
-    key_levels = compute_key_levels(df_1h)
-    comp_1h = compress_ohlcv_to_string(df_1h, '1h')
+        log.info("[09:02] 🤖 Asking Gemini for Pre-Market Analysis...")
+        analysis = analyze_premarket(comp_1h, news, key_levels)
+        state.premarket_analysis = analysis
 
-    news = fetch_nifty_news()
-
-    log.info("[09:02] 🤖 Asking Gemini for Pre-Market Analysis...")
-    analysis = analyze_premarket(comp_1h, news, key_levels)
-    state.premarket_analysis = analysis
-
-    bias = analysis.get("strategy_suggestion", "WAIT")
-    log.info(f"🤖 LLM Suggestion: {bias} | Confidence: {analysis.get('confidence')}")
+        bias = analysis.get('strategy_suggestion', 'WAIT')
+        log.info(f"🤖 LLM: {bias} | Confidence: {analysis.get('confidence')} | {analysis.get('reasoning','')[:80]}")
+    except Exception as e:
+        log.error(f"job_premarket error: {e}")
 
 
 def job_market_open():
-    log.info("\n[09:30] 📈 Fetching first 30-min candle...")
-    open_data = fetch_first_30min_candle()
+    log.info("\n[09:30] 📈 Market open scan...")
+    try:
+        open_data      = fetch_first_30min_candle()
+        final_analysis = analyze_market_open(state.premarket_analysis, open_data)
+        direction      = final_analysis.get('final_direction', 'NO_TRADE')
+        confidence     = final_analysis.get('confidence', 'LOW')
+        log.info(f"🤖 LLM Open: {direction} | Confidence: {confidence}")
+    except Exception as e:
+        log.error(f"job_market_open error: {e}")
 
-    log.info("[09:31] 🤖 Asking Gemini for Market Open Confirmation...")
-    final_analysis = analyze_market_open(state.premarket_analysis, open_data)
 
-    direction  = final_analysis.get("final_direction", "NO_TRADE")
-    confidence = final_analysis.get("confidence", "LOW")
+def job_eod():
+    log.info("\n[15:15] 🛑 End of Day — force-closing open positions...")
+    with state.active_position_lock:
+        pos = state.active_position
+        if pos and pos.get('status') == 'OPEN':
+            close_order(pos['order_id'], 'EOD_EXIT', pnl=0.0, live=state.live_mode)
+            state.active_position = None
+    state.daily_trades = 0
+    state.last_rating_score = 0.0
+    log.info("✅ EOD done. Good night! 🌙")
 
-    log.info(f"🤖 LLM Final Decision: {direction} | Confidence: {confidence}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MONITOR CALLBACK  — called by monitor thread when position closes
+# ─────────────────────────────────────────────────────────────────────────────
+def _on_position_closed():
+    """Called by the monitor thread when a position is fully closed."""
+    with state.active_position_lock:
+        state.active_position = None
+    log.info("📭 Position cleared — bot ready for next signal.")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  TRADE EXECUTION
+# ─────────────────────────────────────────────────────────────────────────────
 def execute_scalp_trade(rating_score: float, direction: str):
-    """
-    Called when multi-indicator rating crosses STRONG_BUY / STRONG_SELL threshold.
-    direction: 'SCALP_LONG' (buy CE) or 'SCALP_SHORT' (buy PE)
-    """
     if state.daily_trades >= 3:
-        log.warning("🚫 Max daily trades (3) reached. No more entries today.")
+        log.warning("🚫 Max 3 trades/day reached.")
         return
 
     current_balance = get_balance(state.live_mode)
     if current_balance < 1500.0:
-        log.warning(f"⚠️ Balance too low (₹{current_balance:.2f}). Need ≥ ₹1500.")
+        log.warning(f"⚠️ Balance ₹{current_balance:.2f} too low (need ≥ ₹1500).")
         return
 
     df = _get_enriched_df()
     if df is None or df.empty:
-        log.error("❌ Could not fetch live 5m data for trade execution.")
+        log.error("❌ No live data for trade execution.")
         return
 
-    spot = float(df['Close'].iloc[-1])
-    premium_target = current_balance / 25.0
-
+    spot        = float(df['Close'].iloc[-1])
     strike_info = select_strike(direction, spot, current_balance)
-    premium = strike_info.get("simulated_premium", premium_target)
+    premium     = strike_info.get('simulated_premium', 0.0)
 
-    qty, cost, lots = calculate_qty(current_balance, premium)
+    if premium <= 0:
+        log.warning("⚠️ No valid live premium found — skipping trade.")
+        return
+
+    qty, cost, _ = calculate_qty(current_balance, premium)
     if qty == 0:
-        log.warning("⚠️ Qty = 0 (balance too low for 1 lot). Skipping.")
+        log.warning(f"⚠️ Insufficient balance for 1 lot @ ₹{premium:.2f}.")
         return
 
     sl_pct, tp_pct = calculate_dynamic_risk(premium)
-    sl_price = premium * (1 - sl_pct)
-    tp_price = premium * (1 + tp_pct)
+    sl_price = round(premium * (1 - sl_pct), 2)
+    tp_price = round(premium * (1 + tp_pct), 2)
 
-    opt_type = "CE" if direction == "SCALP_LONG" else "PE"
-    log.info(f"🎯 NIFTY {strike_info['strike']} {opt_type} | "
-             f"Premium: ₹{premium:.2f} | Qty: {qty} | Cost: ₹{cost:.2f} | "
-             f"SL: ₹{sl_price:.2f} | TP: ₹{tp_price:.2f} | "
-             f"Rating score: {rating_score:+.2f}")
+    opt_type = 'CE' if direction == 'SCALP_LONG' else 'PE'
+    log.info(
+        f"🎯 NIFTY {strike_info['strike']} {opt_type} | "
+        f"Premium ₹{premium:.2f} | Qty {qty} | Cost ₹{cost:.0f} | "
+        f"SL ₹{sl_price:.2f} | TP ₹{tp_price:.2f} | Score {rating_score:+.2f}"
+    )
 
     order = place_order(
         strike_info['security_id'], direction, qty,
         premium, sl_price, tp_price, state.live_mode
     )
-    if order:
-        state.active_position = order
-        state.daily_trades += 1
-        threading.Thread(
-            target=monitor_position, args=(order, state.live_mode), daemon=True
-        ).start()
-
-
-def scalp_poll():
-    """
-    Runs every 3 minutes between 09:35 and 14:45 IST.
-    Computes the multi-indicator rating and enters on STRONG_BUY/SELL crossover.
-    """
-    now_str = datetime.now().strftime("%H:%M")
-    now_h   = datetime.now().hour
-    now_m   = datetime.now().minute
-
-    # ── Time guards (professional scalping hours only) ──────────────────
-    if now_str < "09:35": return
-    if now_str > "14:45": return
-    if now_h == 12 or (now_h == 13 and now_m < 15): return  # noon lull
-
-    # ── Already in a trade — skip entry logic ───────────────────────────
-    if state.active_position is not None:
+    if not order:
         return
 
-    # ── Fetch live data and compute rating ──────────────────────────────
+    with state.active_position_lock:
+        state.active_position = order
+    state.daily_trades += 1
+
+    threading.Thread(
+        target=monitor_position,
+        args=(order, state.live_mode, _on_position_closed),
+        daemon=True
+    ).start()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SCALP POLL  (every 3 minutes during market hours)
+# ─────────────────────────────────────────────────────────────────────────────
+def scalp_poll():
+    now     = datetime.now(IST)
+    now_hm  = now.hour * 60 + now.minute   # integer minutes since midnight
+
+    # ── Time guards ────────────────────────────────────────────────────────
+    OPEN  = 9 * 60 + 35    # 09:35
+    CLOSE = 14 * 60 + 45   # 14:45
+    NOON_S = 12 * 60        # 12:00
+    NOON_E = 13 * 60 + 15   # 13:15
+
+    if now_hm < OPEN or now_hm > CLOSE:
+        return
+    if NOON_S <= now_hm <= NOON_E:
+        return
+
+    # ── Already in a trade? ─────────────────────────────────────────────
+    with state.active_position_lock:
+        in_trade = state.active_position is not None
+    if in_trade:
+        return
+
+    # ── Fetch data & compute rating ─────────────────────────────────────
     df = _get_enriched_df()
     if df is None or df.empty:
-        log.warning("⚠️ [Scalp Poll] No live data. Will retry next cycle.")
+        log.warning("⚠️ [Poll] No live data. Retry next cycle.")
         return
 
-    # Use last 50 bars as window
     window_df  = df.iloc[-50:].copy()
     rsi_window = window_df['RSI']
-    adx_val    = float(df['ADX'].iloc[-1])
+    adx_val    = float(df['ADX'].iloc[-1]) if not df['ADX'].isna().all() else 20.0
     macd_w     = window_df['MACD_HIST']
 
     rating = compute_multi_rating(window_df, rsi_window, adx_val, macd_w)
@@ -191,55 +236,50 @@ def scalp_poll():
     bd     = rating['breakdown']
 
     log.info(
-        f"[{now_str}] 📊 Rating: {rating['rating']} ({score:+.2f}) | "
+        f"[{now.strftime('%H:%M')}] 📊 {rating['rating']} ({score:+.2f}) | "
         f"ADX:{bd.get('adx',0):.0f} RSI:{bd.get('rsi',0):.0f} "
         f"ORB:{bd.get('structure_orb',0):+.0f} "
-        f"Vol:{'✅' if bd.get('volume_confirm') else '❌'}"
+        f"Vol:{'✅' if bd.get('volume_confirm') else '❌'} "
+        f"Trades today:{state.daily_trades}/3"
     )
 
-    # ── Crossover detection ─────────────────────────────────────────────
-    prev_score = state.last_rating_score
+    prev_score            = state.last_rating_score
     state.last_rating_score = score
 
     if score >= RATING_STRONG_BUY and prev_score < RATING_STRONG_BUY:
-        log.info(f"🟢 STRONG BUY signal! Score crossed +{RATING_STRONG_BUY} → Entering CE")
-        execute_scalp_trade(score, "SCALP_LONG")
-
+        log.info(f"🟢 STRONG BUY crossed +{RATING_STRONG_BUY} → Buy CE")
+        execute_scalp_trade(score, 'SCALP_LONG')
     elif score <= RATING_STRONG_SELL and prev_score > RATING_STRONG_SELL:
-        log.info(f"🔴 STRONG SELL signal! Score crossed {RATING_STRONG_SELL} → Entering PE")
-        execute_scalp_trade(score, "SCALP_SHORT")
+        log.info(f"🔴 STRONG SELL crossed {RATING_STRONG_SELL} → Buy PE")
+        execute_scalp_trade(score, 'SCALP_SHORT')
 
 
-def job_eod():
-    log.info("\n[15:15] 🛑 End of Day — force-closing any open positions...")
-    if state.active_position and state.active_position.get('status') == 'OPEN':
-        from .trade_executor import close_order
-        close_order(state.active_position['order_id'], "EOD_EXIT", state.live_mode)
-        state.active_position = None
-    state.daily_trades = 0    # reset for next day
-    state.last_rating_score = 0.0
-    log.info("✅ EOD complete. Good night! 🌙")
-
-
-def start_scheduler(live_mode=False):
+# ─────────────────────────────────────────────────────────────────────────────
+#  ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+def start_scheduler(live_mode: bool = False):
     state.live_mode = live_mode
-    mode_str = "🔴 LIVE" if live_mode else "🟢 PAPER"
-    log.info(f"\n{'='*50}")
+    mode_str = '🔴 LIVE' if live_mode else '🟢 PAPER'
+
+    balance = get_balance(live_mode)
+    log.info(f"\n{'='*52}")
     log.info(f"  {mode_str} MODE — Nifty 50 Scalping Bot")
-    log.info(f"  Jobs: Pre-market 09:00 | Open 09:30 | EOD 15:15")
-    log.info(f"  Scalp polling: every 3 min from 09:35 → 14:45")
-    log.info(f"  Waiting for next scheduled event...")
-    log.info(f"{'='*50}\n")
+    log.info(f"  Balance      : ₹{balance:.2f}")
+    log.info(f"  Pre-market   : {TIME_PRE_MARKET}  |  Open: {TIME_MARKET_OPEN}  |  EOD: {TIME_EOD_CHECK}")
+    log.info(f"  Scalp poll   : every 3 min | 09:35 → 14:45 (skip 12:00–13:15)")
+    log.info(f"  Max trades   : 3/day  |  Max hold: 60 min")
+    log.info(f"{'='*52}\n")
 
     schedule.every().day.at(TIME_PRE_MARKET).do(job_premarket)
     schedule.every().day.at(TIME_MARKET_OPEN).do(job_market_open)
     schedule.every().day.at(TIME_EOD_CHECK).do(job_eod)
     schedule.every(3).minutes.do(scalp_poll)
 
-    # If started after 09:00, run a poll immediately so you see activity NOW
-    now_str = datetime.now().strftime("%H:%M")
-    if "09:35" <= now_str <= "14:45":
-        log.info("⚡ Started during market hours — running first poll immediately...")
+    # Immediate poll if started during market hours
+    now     = datetime.now(IST)
+    now_hm  = now.hour * 60 + now.minute
+    if (9 * 60 + 35) <= now_hm <= (14 * 60 + 45):
+        log.info("⚡ Market hours active — running first poll now...")
         scalp_poll()
 
     try:
@@ -247,4 +287,4 @@ def start_scheduler(live_mode=False):
             schedule.run_pending()
             time.sleep(1)
     except KeyboardInterrupt:
-        log.info("\n🛑 Bot manually stopped with Ctrl+C")
+        log.info("\n🛑 Bot stopped with Ctrl+C")

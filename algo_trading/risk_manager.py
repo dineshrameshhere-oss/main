@@ -1,7 +1,8 @@
 import time
+from typing import Callable
 from .logger import log
 from .trade_executor import close_order
-from .config import DEFAULT_SL_PCT, MAX_DAILY_LOSS_PCT, TRAILING_STEPS
+from .config import DEFAULT_SL_PCT, MAX_DAILY_LOSS_PCT, TRAILING_STEPS, BROKERAGE_PER_TRADE
 
 # Max retries when LTP fetch returns zero (API hiccup)
 _LTP_ZERO_MAX_RETRIES = 5
@@ -42,17 +43,19 @@ def _fetch_live_premium(security_id: str) -> float:
     return 0.0
 
 
-def monitor_position(order: dict, live: bool = False):
+def monitor_position(order: dict, live: bool = False,
+                     on_close: Callable | None = None):
     """
     Monitors an active trade every 30 seconds.
-    Fetches REAL live LTP from INDMoney API for both PAPER and LIVE modes.
-    (Paper vs live only affects order placement — not monitoring.)
+    Fetches REAL live LTP from INDMoney API for BOTH paper and live modes.
+    Calls on_close() when the trade is fully closed so the scheduler
+    can clear active_position and accept the next signal.
 
     Exit conditions:
       1. Stepped trailing SL hit  → TRAILING_SL_STEP
-      2. Hard SL hit (no step triggered) → HARD_SL
-      3. Daily loss circuit breaker      → DAILY_LOSS_LIMIT
-      4. 60-minute max hold              → TIME_LIMIT_EXIT
+      2. Hard SL hit              → HARD_SL
+      3. Daily loss circuit       → DAILY_LOSS_LIMIT
+      4. 60-minute max hold       → TIME_LIMIT_EXIT
     """
     if not order:
         return
@@ -70,6 +73,7 @@ def monitor_position(order: dict, live: bool = False):
             f"[{order_id}] Security ID is a dummy ({security_id}). "
             f"Cannot monitor — no live LTP available."
         )
+        if on_close: on_close()
         return
 
     # Tracking state
@@ -100,6 +104,7 @@ def monitor_position(order: dict, live: bool = False):
             if zero_ltp_retries >= _LTP_ZERO_MAX_RETRIES:
                 log.error(f"[{order_id}] LTP unavailable after {_LTP_ZERO_MAX_RETRIES} retries — force-closing.")
                 close_order(order_id, "LTP_UNAVAILABLE", pnl=0.0, live=live)
+                if on_close: on_close()
                 return
             continue
         zero_ltp_retries = 0
@@ -113,13 +118,19 @@ def monitor_position(order: dict, live: bool = False):
             peak_pnl_pct = pnl_pct
             new_floor = _get_stepped_sl_floor(peak_pnl_pct)
             if new_floor is not None and new_floor > current_sl_floor:
+                # Dynamic brokerage floor: locked PnL must cover ₹50 round-trip cost
+                # floor_pct = brokerage / (entry_premium * qty)
+                brokerage_floor = BROKERAGE_PER_TRADE / (entry * qty)
+                enforced_floor  = max(new_floor, brokerage_floor)
+
                 old_floor        = current_sl_floor
-                current_sl_floor = new_floor
+                current_sl_floor = enforced_floor
                 sl_locked_price  = entry * (1 + current_sl_floor)
                 log.info(
                     f"🔒 STEP-UP [{order_id}] | Peak +{peak_pnl_pct*100:.1f}% | "
-                    f"SL floor: {old_floor*100:+.0f}% → {current_sl_floor*100:+.0f}% "
-                    f"(₹{sl_locked_price:.2f})"
+                    f"SL floor: {old_floor*100:+.1f}% → {current_sl_floor*100:+.1f}% "
+                    f"(₹{sl_locked_price:.2f}) | covers brokerage: "
+                    f"{'YES' if current_sl_floor >= brokerage_floor else 'NO'}"
                 )
 
         effective_sl = entry * (1 + current_sl_floor)
@@ -148,6 +159,7 @@ def monitor_position(order: dict, live: bool = False):
                 f"| Locked {current_sl_floor*100:+.0f}% | PnL ₹{pnl_amount:+.0f}"
             )
             close_order(order_id, reason, pnl=pnl_amount, live=live)
+            if on_close: on_close()
             return
 
         # ── 3. DAILY LOSS CIRCUIT BREAKER ─────────────────────────────────────
@@ -158,6 +170,7 @@ def monitor_position(order: dict, live: bool = False):
                 f"exceeds {MAX_DAILY_LOSS_PCT*100:.0f}% circuit breaker."
             )
             close_order(order_id, "DAILY_LOSS_LIMIT", pnl=pnl_amount, live=live)
+            if on_close: on_close()
             return
 
     # ── 4. 60-MINUTE MAX HOLD REACHED ─────────────────────────────────────────
@@ -170,3 +183,4 @@ def monitor_position(order: dict, live: bool = False):
         f"Exit ₹{final_premium:.2f} | PnL ₹{final_pnl:+.0f}"
     )
     close_order(order_id, "TIME_LIMIT_EXIT", pnl=final_pnl, live=live)
+    if on_close: on_close()

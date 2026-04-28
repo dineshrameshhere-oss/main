@@ -1,41 +1,37 @@
-import requests
 import feedparser
-from bs4 import BeautifulSoup
 from .logger import log
 
-def fetch_nifty_news():
+_RSS_FEEDS = [
+    ('Moneycontrol', 'https://www.moneycontrol.com/rss/marketreports.xml'),
+    ('ET Markets',   'https://economictimes.indiatimes.com/markets/rss.cms'),
+]
+
+def fetch_nifty_news(max_per_feed: int = 5) -> str:
     """
-    Fetches latest news regarding Nifty 50 from RSS feeds.
-    Returns a formatted string of headlines.
+    Fetches latest market headlines from RSS feeds.
+    Returns a formatted string of up to 10 unique headlines.
+    No BeautifulSoup dependency — feedparser handles parsing.
     """
     headlines = []
-    
-    # 1. Moneycontrol RSS
-    try:
-        mc_url = "https://www.moneycontrol.com/rss/marketreports.xml"
-        feed = feedparser.parse(mc_url)
-        for entry in feed.entries[:5]:
-            headlines.append(f"[Moneycontrol] {entry.title}")
-    except Exception as e:
-        log.warning(f"⚠️ Could not fetch Moneycontrol news: {e}")
+    for source, url in _RSS_FEEDS:
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:max_per_feed]:
+                title = entry.get('title', '').strip()
+                if title:
+                    headlines.append(f'[{source}] {title}')
+        except Exception as e:
+            log.warning(f'⚠️ Could not fetch {source} news: {e}')
 
-    # 2. Economic Times RSS
-    try:
-        et_url = "https://economictimes.indiatimes.com/markets/rss.cms"
-        feed = feedparser.parse(et_url)
-        for entry in feed.entries[:5]:
-            headlines.append(f"[ET Markets] {entry.title}")
-    except Exception as e:
-        log.warning(f"⚠️ Could not fetch ET news: {e}")
-        
-    # Deduplicate and format
-    unique_headlines = list(set(headlines))
-    
-    if not unique_headlines:
-        return "No recent news fetched."
-        
-    formatted = ""
-    for i, hl in enumerate(unique_headlines[:15]):
-        formatted += f"{i+1}. {hl}\n"
-        
-    return formatted
+    # Deduplicate preserving order
+    seen = set()
+    unique = []
+    for h in headlines:
+        if h not in seen:
+            seen.add(h)
+            unique.append(h)
+
+    if not unique:
+        return 'No recent news fetched.'
+
+    return '\n'.join(f'{i+1}. {h}' for i, h in enumerate(unique[:10]))
