@@ -11,7 +11,7 @@ from .config import (
     SUPERTREND_PERIOD, SUPERTREND_MULT, RSI_PERIOD)
 from .market_data import (fetch_historical_ohlcv, compress_ohlcv_to_string,
                            fetch_first_30min_candle, fetch_intraday_data,
-                           fetch_finnifty_direction)
+                           fetch_finnifty_direction, fetch_iv_rank)
 from .news_fetcher import fetch_nifty_news
 from .indicators import (compute_key_levels, compute_supertrend, compute_adx_series,
                           compute_macd_hist_series, compute_orb_series, compute_multi_rating,
@@ -264,16 +264,19 @@ def scalp_poll():
     # ── Realized Volatility Gate (skip flat days) ───────────────────────
         return
 
-    # ── PCR + FinNifty (fetch once per poll cycle) ───────────────────────
+    # ── PCR + FinNifty + IVR (fetch once per poll cycle) ──────────────────
     pcr_data    = compute_pcr()
     fnf_dir     = fetch_finnifty_direction()   # 0.0 on error (safe neutral)
+    ivr_data    = fetch_iv_rank()              # {'ivr':50,'iv':0,'signal':0.0} on error
+    ivr_sig     = ivr_data.get('signal', 0.0)
 
     window_df  = df.iloc[-50:].copy()
     rsi_window = window_df['RSI']
     adx_val    = float(df['ADX'].iloc[-1]) if not df['ADX'].isna().all() else 20.0
     macd_w     = window_df['MACD_HIST']
 
-    rating = compute_multi_rating(window_df, rsi_window, adx_val, macd_w, pcr=pcr_data, fnf_direction=fnf_dir)
+    rating = compute_multi_rating(window_df, rsi_window, adx_val, macd_w,
+                                   pcr=pcr_data, fnf_direction=fnf_dir, ivr_signal=ivr_sig)
     score  = rating['score']
     bd     = rating['breakdown']
     state.last_breakdown = bd   # stash for execute_scalp_trade OI log
@@ -282,10 +285,11 @@ def scalp_poll():
     oi_type     = bd.get('oi_coverage', '')
     pcr_txt     = f" PCR:{bd.get('pcr_val',1.0):.2f}" if 'pcr_val' in bd else ""
     log.info(
-        f"[{now.strftime('%H:%M')}] 📊 {rating['rating']} ({score:+.2f}) | "
+        f"[{now.strftime('%H:%M')}] Sigma {rating['rating']} ({score:+.2f}) | "
         f"ADX:{bd.get('adx',0):.0f}{choppy_warn} RSI:{bd.get('rsi',0):.0f} "
         f"ORB:{bd.get('structure_orb',0):+.0f} OI:{oi_type}{pcr_txt} "
-        f"Vol:{'✅' if bd.get('volume_confirm') else '❌'} Trades:{state.daily_trades}/3"
+        f"IVR:{ivr_data.get('ivr',50):.0f}({ivr_sig:+.2f}) "
+        f"Vol:{'OK' if bd.get('volume_confirm') else 'NO'} Trades:{state.daily_trades}/3"
     )
 
     prev_score            = state.last_rating_score

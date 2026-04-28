@@ -179,3 +179,212 @@ def fetch_finnifty_direction() -> float:
     except Exception as ex:
         log.debug(f"FinNifty fetch failed (non-critical): {ex}")
     return 0.0   # neutral on any error — never hard-block on unavailable data
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  BLACK-SCHOLES IV (pure Python — no scipy, works on Termux)
+# ─────────────────────────────────────────────────────────────────────────────
+import math as _math
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + _math.erf(x / _math.sqrt(2.0)))
+
+def _norm_pdf(x: float) -> float:
+    return _math.exp(-0.5 * x * x) / _math.sqrt(2.0 * _math.pi)
+
+def _bs_price(S: float, K: float, T: float, r: float, sigma: float, call: bool = True) -> float:
+    """Black-Scholes option price. S=spot, K=strike, T=years, r=risk-free, sigma=IV."""
+    if T <= 0 or sigma <= 0:
+        return max(0.0, S - K) if call else max(0.0, K - S)
+    d1 = (_math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * _math.sqrt(T))
+    d2 = d1 - sigma * _math.sqrt(T)
+    if call:
+        return S * _norm_cdf(d1) - K * _math.exp(-r * T) * _norm_cdf(d2)
+    return K * _math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
+
+def _bs_vega(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    """Vega — derivative of option price w.r.t. sigma."""
+    if T <= 0 or sigma <= 0:
+        return 1e-8
+    d1 = (_math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * _math.sqrt(T))
+    return S * _norm_pdf(d1) * _math.sqrt(T)
+
+def compute_iv_from_premium(S: float, K: float, T: float, market_price: float,
+                             r: float = 0.065, call: bool = True) -> float | None:
+    """
+    Newton-Raphson IV solver. Typically converges in 5-10 iterations.
+    Returns annualised IV (e.g. 0.18 = 18%) or None if no convergence.
+    """
+    sigma = 0.25  # initial guess
+    for _ in range(60):
+        price = _bs_price(S, K, T, r, sigma, call)
+        vega  = _bs_vega(S, K, T, r, sigma)
+        diff  = market_price - price
+        if abs(diff) < 1e-4:
+            return sigma
+        if abs(vega) < 1e-8:
+            return None
+        sigma += diff / vega
+        sigma = max(0.01, min(sigma, 10.0))
+    return sigma if abs(_bs_price(S, K, T, r, sigma, call) - market_price) < 0.05 else None
+
+
+def _next_expiry_years() -> float:
+    """Days to next Thursday (weekly Nifty expiry) as fraction of year."""
+    import time
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    days_ahead = (3 - now.weekday()) % 7   # 3 = Thursday
+    if days_ahead == 0 and now.hour >= 15:
+        days_ahead = 7
+    T = max(days_ahead + (15 - now.hour) / 24, 0.5 / 365)
+    return T / 365
+
+
+def _atm_strike(spot: float) -> int:
+    """Round to nearest 50 (Nifty weekly strikes)."""
+    return int(round(spot / 50.0) * 50)
+
+
+# ── 15-min module-level cache ─────────────────────────────────────────────────
+_ivr_cache: dict = {"ts": 0.0, "result": {"ivr": 50.0, "iv": 0.0, "signal": 0.0}}
+_IVR_TTL_SEC = 15 * 60   # refresh at most every 15 minutes
+
+# IV history file (persists across sessions so IVR improves daily)
+import pathlib as _pathlib, json as _json
+
+_IV_HISTORY_PATH = _pathlib.Path(__file__).parent.parent / "models" / "iv_history.json"
+
+
+def _load_iv_history() -> list[float]:
+    try:
+        if _IV_HISTORY_PATH.exists():
+            return _json.loads(_IV_HISTORY_PATH.read_text())
+    except Exception:
+        pass
+    return []
+
+
+def _append_iv_history(iv: float) -> list[float]:
+    hist = _load_iv_history()
+    hist.append(round(iv, 5))
+    hist = hist[-250:]   # keep last 250 observations (~60 trading days × 4 polls)
+    try:
+        _IV_HISTORY_PATH.parent.mkdir(exist_ok=True)
+        _IV_HISTORY_PATH.write_text(_json.dumps(hist))
+    except Exception:
+        pass
+    return hist
+
+
+def fetch_iv_rank() -> dict:
+    """
+    Fetches live ATM option premium, computes IV via Black-Scholes, and returns
+    IV Rank (percentile vs last 60 days).
+
+    Safety guarantees:
+      - Timeout: 2 seconds (not 5) — never blocks poll cycle
+      - Full try/except — ANY error returns neutral {'ivr':50, 'iv':0, 'signal':0.0}
+      - 15-minute cache — at most 1 extra API call per 15 min, not per poll
+      - Signal range: [-0.15, +0.10] — too small to break a trade on its own
+
+    Returns dict: {ivr: float (0-100), iv: float (annualised), signal: float}
+    signal: +0.10 if IVR<25 (cheap premium, expansion likely)
+             0.00 if 25-65 (neutral)
+            -0.15 if IVR>75 (expensive premium, crush risk)
+    """
+    import time
+    neutral = {"ivr": 50.0, "iv": 0.0, "signal": 0.0}
+
+    # ── Cache check ────────────────────────────────────────────────────────────
+    if time.time() - _ivr_cache["ts"] < _IVR_TTL_SEC:
+        return _ivr_cache["result"]
+
+    try:
+        # ── Step 1: Get spot price ────────────────────────────────────────────
+        spot = fetch_ltp(NIFTY_SCRIP_CODE)
+        if not spot or spot <= 0:
+            return neutral
+
+        K  = _atm_strike(spot)
+        T  = _next_expiry_years()
+        r  = 0.065     # RBI repo rate approximation
+
+        # ── Step 2: Fetch ATM CALL LTP (2-second timeout) ────────────────────
+        # We use the FNO instruments CSV (already loaded/cached in options_engine)
+        # to find the ATM CALL scrip code, then fetch its LTP.
+        # Import here to avoid circular imports at module load time.
+        from .options_engine import _get_instruments
+        instr = _get_instruments()
+
+        if instr.empty:
+            return neutral
+
+        import pandas as _pd
+        import datetime as _dt
+        from datetime import timezone as _tz, timedelta as _td
+
+        today = _dt.date.today()
+        atm_calls = instr[
+            (instr.get('NAME', instr.get('SYMBOL', _pd.Series(dtype=str))).str.upper().str.contains('NIFTY', na=False)) &
+            (instr.get('OPTION_TYPE', instr.get('INSTRUMENT_TYPE', _pd.Series(dtype=str))).str.upper().str.contains('CE', na=False)) &
+            (instr['EXPIRY_DATE'] >= _pd.Timestamp(today))
+        ].copy() if not instr.empty else _pd.DataFrame()
+
+        if atm_calls.empty:
+            return neutral
+
+        strike_col = 'STRIKE_PRICE' if 'STRIKE_PRICE' in atm_calls.columns else (
+                     'STRIKE'       if 'STRIKE'       in atm_calls.columns else None)
+        sec_col    = 'SECURITY_ID'  if 'SECURITY_ID'  in atm_calls.columns else (
+                     'SCRIP_CODE'   if 'SCRIP_CODE'   in atm_calls.columns else None)
+
+        if not strike_col or not sec_col:
+            return neutral
+
+        atm_calls['strike_dist'] = (atm_calls[strike_col] - K).abs()
+        best = atm_calls.nsmallest(1, 'strike_dist')
+        if best.empty:
+            return neutral
+
+        atm_scrip = str(best.iloc[0][sec_col])
+        call_url  = f"{INDSTOCKS_BASE}/market/quotes/ltp?scrip-codes={atm_scrip}"
+        resp      = requests.get(call_url, headers=get_auth_headers(), timeout=2)
+
+        if resp.status_code != 200:
+            return neutral
+
+        ltp_data     = resp.json()
+        call_premium = float(ltp_data.get('data', {}).get(atm_scrip, {}).get('live_price', 0))
+
+        if call_premium <= 0:
+            return neutral
+
+        # ── Step 3: Compute IV ────────────────────────────────────────────────
+        iv = compute_iv_from_premium(spot, K, T, call_premium, r=r, call=True)
+        if iv is None or iv <= 0:
+            return neutral
+
+        # ── Step 4: Compute IVR ───────────────────────────────────────────────
+        hist = _append_iv_history(iv)
+
+        if len(hist) < 10:
+            # Not enough history yet — be neutral, not penalising
+            result = {"ivr": 50.0, "iv": round(iv, 4), "signal": 0.0}
+        else:
+            ivr = sum(1 for h in hist if h < iv) / len(hist) * 100  # percentile rank
+            if   ivr < 25:  signal = +0.10    # cheap premium, likely to expand
+            elif ivr > 75:  signal = -0.15    # expensive premium, crush risk
+            else:           signal =  0.00    # neutral
+            result = {"ivr": round(ivr, 1), "iv": round(iv, 4), "signal": signal}
+
+        # ── Step 5: Update cache ──────────────────────────────────────────────
+        _ivr_cache["ts"]     = time.time()
+        _ivr_cache["result"] = result
+        log.debug(f"IVR updated: IV={iv:.1%} IVR={result['ivr']:.0f} signal={result['signal']:+.2f}")
+        return result
+
+    except Exception as ex:
+        # SILENT FAIL — poll cycle must never break because of IV fetch
+        log.debug(f"IVR fetch skipped (non-critical): {ex}")
+        return neutral

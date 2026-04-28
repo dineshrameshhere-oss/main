@@ -333,6 +333,7 @@ def compute_multi_rating(
     macd_hist: pd.Series,
     pcr: dict | None = None,
     fnf_direction: float = 0.0,
+    ivr_signal: float = 0.0,
 ) -> dict:
     """
     Proven composite scoring (5 components) with two upgrades:
@@ -478,9 +479,14 @@ def compute_multi_rating(
         score = score * consensus_mult
 
         # ── FinNifty addend (small directional boost/penalty) ─────────────────
-        # +0.20 if FinNifty confirms, −0.20 if it strongly diverges, 0 if flat
         fnf_addend = float(fnf_direction) * 0.20
         score = score + fnf_addend
+
+        # ── IVR addend (IV Rank signal — safe default 0.0 if unavailable) ───
+        # +0.10: IVR<25 — premium cheap, expansion likely  → small boost
+        # -0.15: IVR>75 — premium expensive, crush risk   → small penalty
+        #  0.00: IVR 25-75 or API unavailable             → no effect
+        score = score + float(ivr_signal)
 
         # ── Rating assignment ─────────────────────────────────────────────────
         choppy    = adx_val < 20
@@ -520,6 +526,7 @@ def compute_multi_rating(
                 "agree_voters":     agree,
                 "oppose_voters":    oppose,
                 "finnifty_dir":     fnf_direction,
+                "ivr_signal":       round(ivr_signal, 2),
                 "volume_confirm":   volume_ok,
             },
         }
