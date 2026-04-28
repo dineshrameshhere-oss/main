@@ -332,6 +332,7 @@ def compute_multi_rating(
     adx_val: float,
     macd_hist: pd.Series,
     pcr: dict | None = None,
+    fnf_direction: float = 0.0,
 ) -> dict:
     """
     HYBRID composite rating: EMA crossover as entry trigger + 8 leading
@@ -440,22 +441,27 @@ def compute_multi_rating(
         pcr_val = float(pcr.get("pcr", 1.0)) if pcr else 1.0
         pcr_sig = max(-0.5, min(0.5, (1.0 - pcr_val) * 0.5))
 
+        # ── 10. FinNifty direction (financial sector confirmation) ───────────────
+        # Financials (HDFC, ICICI, Kotak, Axis) = ~40% of Nifty weight.
+        # If FinNifty disagrees with signal direction → likely fake breakout.
+        fnf_sig = max(-0.6, min(0.6, float(fnf_direction) * 0.6))
+
         # ── Weighted composite ────────────────────────────────────────────────
         # EMA gets highest weight (it's the TRIGGER that drives crossovers)
         # OI Coverage second (smart money)
         # ORB third (structural)
         W   = {"ema": 1.2, "stoch": 0.9, "willr": 0.8, "roc": 0.7,
-               "vol": 0.6, "orb": 1.1, "candle": 0.7, "oi": 1.0, "pcr": 0.5}
-        MAX_W = sum(W.values())   # 7.5
+               "vol": 0.6, "orb": 1.1, "candle": 0.7, "oi": 1.0, "pcr": 0.5, "fnf": 0.8}
+        MAX_W = sum(W.values())   # 8.3 with FinNifty
 
         sigs = [ema_sig, stoch_sig, willr_sig, roc_sig,
-                vol_sig, orb_sig, candle_sig, oi_sig, pcr_sig * 2]
+                vol_sig, orb_sig, candle_sig, oi_sig, pcr_sig * 2, fnf_sig * 1.5]
 
         raw = (ema_sig    * W["ema"]    + stoch_sig  * W["stoch"] +
                willr_sig  * W["willr"]  + roc_sig    * W["roc"]   +
                vol_sig    * W["vol"]    + orb_sig    * W["orb"]   +
                candle_sig * W["candle"] + oi_sig     * W["oi"]    +
-               pcr_sig    * W["pcr"])
+               pcr_sig    * W["pcr"]    + fnf_sig    * W["fnf"])
 
         # ── CONSENSUS ANTI-FALSE-SIGNAL MULTIPLIER ────────────────────────────
         # Problem: fast leading indicators (Stoch, WR, EMA) fire individually
@@ -521,6 +527,8 @@ def compute_multi_rating(
                 "agreeing":       agreeing,
                 "opposing":       opposing,
                 "volume_confirm": vol_ratio >= 1.2,
+                "finnifty_dir":   fnf_direction,
+                "finnifty_dir":   fnf_direction,
             },
         }
     except Exception as e:

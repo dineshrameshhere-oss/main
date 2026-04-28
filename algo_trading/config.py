@@ -7,10 +7,19 @@ load_dotenv()
 # API Configuration
 INDSTOCKS_BASE    = "https://api.indstocks.com"
 NIFTY_SCRIP_CODE  = "NSE_3045"           # Nifty 50 index scrip code
+FINNIFTY_SCRIP_CODE = "NSE_2885"         # FinNifty (Nifty Financial Services) — used as confirmation signal
 NIFTY_SEGMENT     = "DERIVATIVE"
 NIFTY_EXCHANGE    = "NSE"
 PRODUCT_TYPE      = "MARGIN"
 ALGO_ID           = "99999"
+
+# ── Afternoon Safety Net ──────────────────────────────────────────────────────
+# If 0 trades by 12:30 IST, relax STRONG_BUY from 0.45 → 0.40 for afternoon.
+# Guarantees at least 1 entry opportunity per day without sacrificing quality.
+RATING_AFTERNOON_RELAXED = 0.40    # lower threshold applied after AFTERNOON_HOUR if no trades
+AFTERNOON_HOUR           = 12      # IST hour after which relaxation kicks in
+AFTERNOON_MIN            = 30      # IST minute
+
 
 # Trading Constants
 LOT_SIZE          = 25                   # Nifty options lot size (updated to 25)

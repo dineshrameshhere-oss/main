@@ -4,7 +4,8 @@ import threading
 from datetime import datetime, timezone, timedelta
 
 from .logger import log
-from .config import (TIME_PRE_MARKET, TIME_MARKET_OPEN, TIME_EOD_CHECK,
+from .config import (
+    RATING_AFTERNOON_RELAXED, AFTERNOON_HOUR, AFTERNOON_MIN,TIME_PRE_MARKET, TIME_MARKET_OPEN, TIME_EOD_CHECK,
                      RATING_STRONG_BUY, RATING_STRONG_SELL,
                      SUPERTREND_PERIOD, SUPERTREND_MULT, RSI_PERIOD,
                      PCR_APPLY_AFTER_HOUR)
@@ -279,15 +280,16 @@ def scalp_poll():
                  f"({rv['range_pct']:.2f}% < {rv['required']:.2f}% min) — flat session, skip")
         return
 
-    # ── PCR (fetch once, reuse in execute) ─────────────────────────────
-    pcr_data = compute_pcr()
+    # ── PCR + FinNifty (fetch once per poll cycle) ───────────────────────
+    pcr_data    = compute_pcr()
+    fnf_dir     = fetch_finnifty_direction()   # 0.0 on error (safe neutral)
 
     window_df  = df.iloc[-50:].copy()
     rsi_window = window_df['RSI']
     adx_val    = float(df['ADX'].iloc[-1]) if not df['ADX'].isna().all() else 20.0
     macd_w     = window_df['MACD_HIST']
 
-    rating = compute_multi_rating(window_df, rsi_window, adx_val, macd_w, pcr=pcr_data)
+    rating = compute_multi_rating(window_df, rsi_window, adx_val, macd_w, pcr=pcr_data, fnf_direction=fnf_dir)
     score  = rating['score']
     bd     = rating['breakdown']
     state.last_breakdown = bd   # stash for execute_scalp_trade OI log
@@ -305,10 +307,18 @@ def scalp_poll():
     prev_score            = state.last_rating_score
     state.last_rating_score = score
 
-    if score >= RATING_STRONG_BUY and prev_score < RATING_STRONG_BUY:
+    # Afternoon safety net: if 0 trades by 12:30, relax threshold slightly
+    _strong_thresh = RATING_STRONG_BUY
+    if (state.daily_trades == 0
+            and now.hour > AFTERNOON_HOUR
+            or (now.hour == AFTERNOON_HOUR and now.minute >= AFTERNOON_MIN)):
+        _strong_thresh = RATING_AFTERNOON_RELAXED
+        log.debug(f"Afternoon relaxed threshold: {_strong_thresh} (0 trades today)")
+
+    if score >= _strong_thresh and prev_score < _strong_thresh:
         log.info(f"🟢 STRONG BUY crossed +{RATING_STRONG_BUY} → Buy CE")
         execute_scalp_trade(score, 'SCALP_LONG', df_enriched=df, pcr=pcr_data)
-    elif score <= RATING_STRONG_SELL and prev_score > RATING_STRONG_SELL:
+    elif score <= -_strong_thresh and prev_score > -_strong_thresh:
         log.info(f"🔴 STRONG SELL crossed {RATING_STRONG_SELL} → Buy PE")
         execute_scalp_trade(score, 'SCALP_SHORT', df_enriched=df, pcr=pcr_data)
 

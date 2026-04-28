@@ -131,3 +131,51 @@ def fetch_ltp(scrip_code=NIFTY_SCRIP_CODE):
     except Exception as e:
         log.error(f"❌ Exception fetching INDMoney LTP: {e}")
     return 0.0
+
+
+def fetch_finnifty_direction() -> float:
+    """
+    Fetches FinNifty (Nifty Financial Services) last 2 candles to determine
+    if financials are trending in the same direction as a Nifty signal.
+
+    Returns:
+        +1.0  — FinNifty bullish  (close > open, or price rising over 2 bars)
+        -1.0  — FinNifty bearish
+         0.0  — flat / API unavailable (neutral — no penalty, no boost)
+
+    Usage: pass as fnf_direction to compute_multi_rating for 10th signal.
+    Financials (HDFC, ICICI, Kotak, Axis) drive ~40% of Nifty weight.
+    If FinNifty diverges from Nifty signal → likely fake breakout → penalise score.
+    """
+    from .config import FINNIFTY_SCRIP_CODE
+    try:
+        import time
+        end_time   = int(time.time() * 1000)
+        start_time = end_time - (2 * 60 * 60 * 1000)   # last 2 hours = enough for 2 candles
+        url = (f"{INDSTOCKS_BASE}/market/historical/5minute"
+               f"?scrip-codes={FINNIFTY_SCRIP_CODE}"
+               f"&start_time={start_time}&end_time={end_time}")
+        res = requests.get(url, headers=get_auth_headers(), timeout=4)
+        if res.status_code == 200:
+            candles = (res.json().get('data', {})
+                                 .get(FINNIFTY_SCRIP_CODE, {})
+                                 .get('candles', []))
+            if len(candles) >= 2:
+                last  = candles[-1]
+                prev  = candles[-2]
+                close_now  = float(last.get('c', 0))
+                close_prev = float(prev.get('c', 0))
+                open_now   = float(last.get('o', close_now))
+                if close_now > open_now and close_now > close_prev:
+                    return +1.0   # both bar and recent trend bullish
+                if close_now < open_now and close_now < close_prev:
+                    return -1.0   # both bar and recent trend bearish
+            # Single candle fallback
+            if candles:
+                c = candles[-1]
+                diff = float(c.get('c', 0)) - float(c.get('o', 0))
+                if   diff > 0: return +0.5
+                elif diff < 0: return -0.5
+    except Exception as ex:
+        log.debug(f"FinNifty fetch failed (non-critical): {ex}")
+    return 0.0   # neutral on any error — never hard-block on unavailable data
