@@ -162,25 +162,12 @@ def execute_scalp_trade(rating_score: float, direction: str,
         log.error("❌ No live data for trade execution.")
         return
 
-    # ── 1. Candle Quality Filter (false breakout) ──────────────────────────
-    cq = _candle_quality(df, direction)
-    if cq['is_rejection']:
-        log.warning(f"⚠️ Candle rejected — {cq['reason']} | Skipping entry.")
-        return
-    log.info(f"  ✅ Candle quality OK (body {cq['body_ratio']:.0%})")
-
-    # ── 2. Momentum Filter ─────────────────────────────────────────────────
-    mom = _momentum_signal(df, direction)
-    if not mom['ok']:
-        log.warning(f"⚠️ Momentum weak — {mom['move_pct']:+.3f}% in 30 min "
-                    f"(need ≥{mom['required_pct']:.3f}%) | Skipping.")
-        return
-    log.info(f"  ✅ Momentum OK ({mom['move_pct']:+.3f}% in 30 min)")
-
-    # PCR is the 5th scoring component in compute_multi_rating (not a hard gate).
-    # It already influenced the STRONG_BUY/SELL crossover threshold.
+    # Candle quality + momentum are now scored inside compute_multi_rating
+    # (candle_sig weight=0.7, mom_sig weight=0.6) — no hard gates here.
+    # The crossover threshold already ensured both confirmed the direction.
     if pcr:
         log.info(f"  📊 PCR={pcr.get('pcr',1.0):.2f} ({pcr.get('bias','N/A')}) | included in composite score")
+
 
     # ── 4. Strike selection ───────────────────────────────────────────────
     spot        = float(df['Close'].iloc[-1])
