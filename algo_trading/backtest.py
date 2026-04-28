@@ -158,6 +158,7 @@ def run_backtest(initial_capital: float = 5000.0):
 
     # Per-trade state
     current_premium_target = 0
+    current_qty            = 1
     peak_pnl_pct           = 0.0
     sl_floor_pct           = -DEFAULT_SL_PCT
     current_sl_pts         = 0.0
@@ -186,7 +187,7 @@ def run_backtest(initial_capital: float = 5000.0):
                 prev_close   = df['Close'].iloc[i - 1]
                 est_delta    = min(0.8, max(0.2, current_premium_target / 300.0))
                 exit_pnl_pts = (prev_close - entry_price) * trade_dir
-                exit_pnl_inr = exit_pnl_pts * est_delta * 25
+                exit_pnl_inr = exit_pnl_pts * est_delta * current_qty
                 capital += exit_pnl_inr
                 trades.append({
                     "date": date, "type": "LONG" if trade_dir == 1 else "SHORT",
@@ -249,7 +250,7 @@ def run_backtest(initial_capital: float = 5000.0):
                 exit_hit = True; exit_pnl_pct = bar_close_pnl_pct; reason = "TIME_EXIT"
 
             if exit_hit:
-                exit_pnl_inr = exit_pnl_pct * current_premium_target * 25
+                exit_pnl_inr = exit_pnl_pct * current_premium_target * current_qty
                 capital += exit_pnl_inr
                 trades.append({
                     "date": date, "type": "LONG" if trade_dir == 1 else "SHORT",
@@ -266,7 +267,7 @@ def run_backtest(initial_capital: float = 5000.0):
             if in_trade and row.name.time().hour == 15 and row.name.time().minute >= 15:
                 est_delta       = min(0.8, max(0.2, current_premium_target / 300.0))
                 close_nifty_pct = ((row['Close'] - entry_price) * trade_dir * est_delta) / max(current_premium_target, 1)
-                exit_pnl_inr    = close_nifty_pct * current_premium_target * 25
+                exit_pnl_inr    = close_nifty_pct * current_premium_target * current_qty
                 capital += exit_pnl_inr
                 trades.append({
                     "date": date, "type": "LONG" if trade_dir == 1 else "SHORT",
@@ -294,8 +295,16 @@ def run_backtest(initial_capital: float = 5000.0):
         # Rule 4: ORB only valid after 9:44 — must wait for range to form
         # (handled inside compute_multi_rating — orb_sig=0 if before 9:45)
 
-        premium_target = capital / 25.0
-        if premium_target < 20: continue
+        # ── Option premium: realistic fixed price (not capital-derived) ──────
+        # Nifty OTM CALL/PUT intraday: typical ₹150-250 depending on IV.
+        # API Nifty is scaled ~1107 (real ~24000), so delta/premium math stays
+        # in real-world terms. We use a fixed ₹200 ATM premium.
+        ATM_PREMIUM   = 200.0           # Rs per unit (realistic OTM intraday)
+        MAX_BUDGET    = min(capital * 0.30, 2000.0)   # risk max 30% or ₹2000
+        qty           = max(1, int(MAX_BUDGET / ATM_PREMIUM))
+        premium_target = ATM_PREMIUM
+        if premium_target * qty > capital:
+            continue   # not enough capital even for 1 unit
 
         # ── MULTI-INDICATOR RATING ────────────────────────────────────────────
         window_df   = df.iloc[max(0, i-50):i+1].copy()
@@ -316,21 +325,20 @@ def run_backtest(initial_capital: float = 5000.0):
 
         direction = 'SCALP_LONG' if new_long else 'SCALP_SHORT'
 
-        # Filters removed -- compute_multi_rating score handles all quality checks.
-
-        # ── All filters passed — enter trade, consume crossover ─────────────
+        # ── All filters passed — enter trade ────────────────────────────────
         prev_rating_score = score
         in_trade   = True
         trade_dir  = 1 if new_long else -1
         entry_price            = float(row['Close'])
         daily_trades           += 1
-        current_premium_target = premium_target
+        current_premium_target = ATM_PREMIUM
+        current_qty            = qty
         entry_bar_idx          = i
         peak_pnl_pct           = 0.0
         sl_floor_pct           = -DEFAULT_SL_PCT
         atr = float(row['ATR']) if not pd.isna(row['ATR']) else 3.0
-        current_sl_pts = max(atr * 2.5, 5.0)   # 2.5× ATR SL
-        current_tp_pts = max(atr * 2.5, 6.0)   # 2.5× ATR TP (matches 8% option TP)
+        current_sl_pts = max(atr * 2.5, 5.0)
+        current_tp_pts = max(atr * 2.5, 6.0)
 
 
     # Analysis
