@@ -13,9 +13,11 @@ from .market_data import (fetch_historical_ohlcv, compress_ohlcv_to_string,
                            fetch_first_30min_candle, fetch_intraday_data,
                            fetch_finnifty_direction, fetch_iv_rank)
 from .news_fetcher import fetch_nifty_news
-from .indicators import (compute_key_levels, compute_supertrend, compute_adx_series,
-                          compute_macd_hist_series, compute_orb_series, compute_multi_rating,
-                          compute_greeks)
+from .indicators import (
+    compute_key_levels, compute_supertrend, compute_adx_series,
+    compute_macd_hist_series, compute_orb_series, compute_multi_rating,
+    compute_greeks, check_rv_gate
+)
 from .llm_analyst import analyze_premarket, analyze_market_open
 from .options_engine import select_strike, calculate_qty, calculate_dynamic_risk, compute_pcr
 from .trade_executor import place_order, get_balance, close_order
