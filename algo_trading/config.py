@@ -29,7 +29,27 @@ INTRADAY_TSL_TRAIL         = 8.0         # Trail by 8%
 
 # Trading Constants
 LOT_SIZE          = 25                   # Nifty options lot size (updated to 25)
-MAX_TRADE_BUDGET  = 2000                 # Strict low capital focus
+
+# ── Position Scaling Tiers (Quality Premium Focus) ───────────────────────────
+# Each lot = 25 units. We prioritize QUALITY (ATM/Shallow OTM) over quantity.
+# High Delta (0.45+) premiums cost more (₹100–₹250), so we scale slower.
+#
+# Capital Tier     | Max Lots | Approx. Cost per Trade
+# -----------------|----------|----------------------------------
+# ₹5,000           | 1 lot    | ₹2,500 - ₹4,000
+# ₹15,000          | 2 lots   | ₹5,000 - ₹8,000
+# ₹30,000          | 3 lots   | ₹7,500 - ₹12,000
+# ₹60,000          | 4 lots   | ₹10,000 - ₹16,000
+# ₹1,20,000        | 5 lots   | ₹12,500 - ₹20,000
+#
+# NOTE: Only scale up on STRONG_BUY signals (score >= 0.85).
+LOT_SCALE_TIERS = [
+    (5_000,   1),   # ₹5K  → 1 lot
+    (15_000,  2),   # ₹15K → 2 lots
+    (30_000,  3),   # ₹30K → 3 lots
+    (60_000,  4),   # ₹60K → 4 lots
+    (120_000, 5),   # ₹120K → 5 lots
+]
 
 # LLM Config
 GEMINI_MODEL      = "gemini-2.0-flash"

@@ -219,16 +219,17 @@ def get_security_id_for_option(strike: float, opt_type: str, expiry: pd.Timestam
 # ─────────────────────────────────────────────────────────────────────────────
 def select_strike(direction: str, spot_price: float, budget: float) -> dict:
     """
-    Finds the best affordable NIFTY option strike with a real live premium.
-
+    Finds a 'Quality Premium' NIFTY option strike (Delta 0.35 - 0.55).
+    
     Strategy:
-    - Always 1 lot (25 qty)
-    - Buy the highest-delta (most expensive) option we can afford
-    - Check real live LTPs from NFO_<security_id>
-    - Round trip: instruments CSV → security ID → NFO quote LTP
+    - Prioritize liquidity and premium sensitivity over 'cheapness'.
+    - Target Delta range: 0.35 to 0.55 (Shallow OTM to ATM).
+    - If budget allows, buy the highest quality (closest to ATM) strike.
+    - If budget is tight, buy the best affordable strike in the range.
 
     Returns dict with security_id, strike, type, simulated_premium.
     """
+    from .indicators import compute_greeks
     opt_type = "CE" if "LONG" in direction else "PE"
 
     # Ensure spot is real Nifty 50 level
@@ -239,19 +240,16 @@ def select_strike(direction: str, spot_price: float, budget: float) -> dict:
     # ATM rounded to nearest 50
     atm = round(spot_price / 50) * 50
 
-    # Build strike list: ATM ± 4 strikes (200 pts range)
-    strikes = [atm + (i * 50) for i in range(-4, 5)]  # 9 strikes
+    # Build strike list: ATM ± 5 strikes (250 pts range)
+    # We look further OTM if budget is tight, and further ITM if we want quality.
+    strikes = [atm + (i * 50) for i in range(-5, 6)]
 
-    log.info(f"Searching {opt_type} strikes around ATM {atm} (spot {spot_price:.0f}) | Budget Rs {budget:.0f}")
+    log.info(f"Searching Quality {opt_type} strikes around ATM {atm} | Budget Rs {budget:.0f}")
 
     df = _get_instruments()
     today = pd.to_datetime(datetime.date.today())
 
-    best_strike   = atm
-    best_premium  = 0.0
-    best_sec_id   = ""
-    near_expiry   = None
-
+    candidates = []
     if not df.empty:
         nifty_opts = df[
             df['TRADING_SYMBOL'].str.upper().str.startswith('NIFTY', na=False) &
@@ -263,30 +261,60 @@ def select_strike(direction: str, spot_price: float, budget: float) -> dict:
         if not nifty_opts.empty:
             near_expiry = nifty_opts['EXPIRY_DATE'].min()
             near_opts = nifty_opts[nifty_opts['EXPIRY_DATE'] == near_expiry]
+            days_to_exp = max(1, (near_expiry.date() - datetime.date.today()).days)
 
             for strike in strikes:
                 row = near_opts[near_opts['STRIKE_PRICE'] == float(strike)]
-                if row.empty:
-                    continue
+                if row.empty: continue
 
                 sec_id = f"NFO_{int(row.iloc[0]['SECURITY_ID'])}"
                 ltp    = _fetch_option_ltp_raw(sec_id)
+                if ltp <= 0: continue
 
-                if ltp <= 0:
-                    continue
-
+                # Calculate Delta to verify 'Quality'
+                greeks = compute_greeks(spot_price, strike, days_to_exp, ltp, opt_type)
+                delta = greeks['delta']
                 cost = ltp * LOT_SIZE
-                log.info(f"  {strike} {opt_type}: Rs {ltp:.2f}/unit | Cost Rs {cost:.0f} | {sec_id}")
 
-                if cost <= budget and ltp > best_premium:
-                    best_premium = ltp
-                    best_strike  = strike
-                    best_sec_id  = sec_id
+                log.info(f"  {strike} {opt_type}: Rs {ltp:.2f} | Delta {delta:.2f} | Cost Rs {cost:.0f}")
 
-    if best_premium > 0:
-        log.info(f"✅ Best strike: NIFTY {best_strike} {opt_type} @ Rs {best_premium:.2f} | {best_sec_id}")
+                if cost <= budget:
+                    candidates.append({
+                        'strike': strike,
+                        'premium': ltp,
+                        'sec_id': sec_id,
+                        'delta': delta,
+                        'days_to_exp': days_to_exp
+                    })
+
+    # Selection Logic:
+    # 1. Preferred range: Delta 0.40 - 0.60 (ATM focus for maximum profitability)
+    # 2. Pick the one with HIGHEST delta within this range (closest to ATM)
+    # 3. If none in range, pick the one with delta closest to 0.45 (Quality OTM)
+    
+    best_choice = None
+    
+    # Filter for preferred quality range
+    quality_candidates = [c for c in candidates if 0.40 <= c['delta'] <= 0.65]
+    
+    if quality_candidates:
+        # Pick highest delta (most sensitive/ATM)
+        best_choice = max(quality_candidates, key=lambda x: x['delta'])
+    elif candidates:
+        # Fallback: pick the one closest to 0.45 delta (the 'best' quality we can afford)
+        best_choice = max(candidates, key=lambda x: x['delta'])
+
+    if best_choice:
+        log.info(f"✅ Quality Match: NIFTY {best_choice['strike']} {opt_type} @ Rs {best_choice['premium']:.2f} (Delta {best_choice['delta']:.2f})")
+        return {
+            "security_id":       best_choice['sec_id'],
+            "strike":            best_choice['strike'],
+            "type":              opt_type,
+            "days_to_expiry":    best_choice['days_to_exp'],
+            "simulated_premium": best_choice['premium']
+        }
     else:
-        log.warning("⚠️ Could not find live option premium. Check token or market hours.")
+        log.warning("⚠️ No affordable quality strikes found.")
         return {
             "security_id":       f"NFO_DUMMY_{int(atm)}_{opt_type}",
             "strike":            atm,
@@ -295,42 +323,55 @@ def select_strike(direction: str, spot_price: float, budget: float) -> dict:
             "simulated_premium": 0.0
         }
 
-    days_to_exp = max(1, (near_expiry.date() - datetime.date.today()).days) if near_expiry is not None else 7
-    return {
-        "security_id":       best_sec_id,
-        "strike":            best_strike,
-        "type":              opt_type,
-        "days_to_expiry":    days_to_exp,
-        "simulated_premium": best_premium
-    }
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  RISK SIZING
 # ─────────────────────────────────────────────────────────────────────────────
 def calculate_dynamic_risk(premium: float):
     """
-    SL/TP calibrated to real option move distribution.
-    TP at 8% across all tiers — achievable given avg peak PnL of +1.6% per 5m.
+    SL/TP calibrated to OTM momentum scalping.
+    TP at 25% — achievable given that on strong momentum days,
+    OTM premiums can 2-3x easily (100→250 is 150% gain).
     The trailing SL ladder in config.py takes over once price moves in our favour.
     """
     if premium < 80:
-        return 0.10, 0.08   # Deep OTM — SL 10%, TP 8%
+        return 0.10, 0.25   # Deep OTM — SL 10%, TP 25% (needs big move)
     elif premium < 180:
-        return 0.08, 0.08   # ATM-ish
+        return 0.08, 0.25   # ATM-ish — SL 8%, TP 25%
     else:
-        return 0.05, 0.08   # ITM — tight SL, same TP
+        return 0.05, 0.25   # ITM — tight SL, same TP
 
 
 def calculate_qty(budget: float, option_premium: float, lot_size: int = LOT_SIZE):
-    """Always exactly 1 lot. Returns (qty, cost, lots)."""
+    """
+    Calculates how many lots to buy based on budget and LOT_SCALE_TIERS.
+    Only returns multiple lots if conviction is STRONG_BUY (enforced by caller).
+    Returns (qty, cost, lots).
+    """
     if option_premium <= 0:
         return 0, 0, 0
-    cost = option_premium * lot_size
-    if budget < cost:
-        log.warning(f"Budget Rs {budget:.0f} < cost Rs {cost:.0f} for 1 lot @ Rs {option_premium:.2f}")
+    
+    from .config import LOT_SCALE_TIERS
+    cost_per_lot = option_premium * lot_size
+    
+    # Find max affordable lots based on tier
+    max_lots = 1
+    for tier_cap, tier_lots in sorted(LOT_SCALE_TIERS, key=lambda x: x[0], reverse=True):
+        if budget >= tier_cap:
+            max_lots = tier_lots
+            break
+    
+    # Cap at what budget actually allows
+    budget_lots = int(budget / cost_per_lot)
+    max_lots = min(max_lots, budget_lots)
+    
+    if max_lots < 1:
+        log.warning(f"Budget Rs {budget:.0f} < cost Rs {cost_per_lot:.0f} for 1 lot @ Rs {option_premium:.2f}")
         return 0, 0, 0
-    return lot_size, cost, 1
+    
+    qty = max_lots * lot_size
+    cost = qty * option_premium
+    return qty, cost, max_lots
 
 
 # ─────────────────────────────────────────────────────────────────────────────
