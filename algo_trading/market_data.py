@@ -123,18 +123,27 @@ def fetch_first_30min_candle():
 
 def fetch_ltp(scrip_code=NIFTY_SCRIP_CODE):
     """
-    Fetch Last Traded Price directly from INDMoney API.
+    Fetch Last Traded Price directly from INDMoney API with retry/timeout.
     """
-    try:
-        url = f"{INDSTOCKS_BASE}/market/quotes/ltp?scrip-codes={scrip_code}"
-        res = requests.get(url, headers=get_auth_headers(), timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            return float(data.get('data', {}).get(scrip_code, {}).get('live_price', 0))
-        else:
+    import time
+    url = f"{INDSTOCKS_BASE}/market/quotes/ltp?scrip-codes={scrip_code}"
+    
+    for attempt in range(2):
+        try:
+            res = requests.get(url, headers=get_auth_headers(), timeout=8)
+            if res.status_code == 200:
+                data = res.json()
+                return float(data.get('data', {}).get(scrip_code, {}).get('live_price', 0))
+            
             log.error(f"❌ INDMoney LTP API Error: {res.status_code} - {res.text}")
-    except Exception as e:
-        log.error(f"❌ Exception fetching INDMoney LTP: {e}")
+            return 0.0
+        except Exception as e:
+            if attempt == 0:
+                log.warning(f"LTP fetch retry for {scrip_code} due to: {e}")
+                time.sleep(1)
+                continue
+            log.error(f"❌ Exception fetching INDMoney LTP: {e}")
+            return 0.0
     return 0.0
 
 

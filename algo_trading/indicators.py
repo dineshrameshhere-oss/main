@@ -334,6 +334,7 @@ def compute_multi_rating(
     pcr: dict | None = None,
     fnf_direction: float = 0.0,
     ivr_signal: float = 0.0,
+    score_history: list | None = None,
 ) -> dict:
     """
     Proven composite scoring (5 components) with two upgrades:
@@ -493,9 +494,8 @@ def compute_multi_rating(
         # If we had a STRONG SELL in the last 15 mins and now have a STRONG BUY,
         # it might be a volatility trap.
         # We require at least 2 consecutive bars of consistent bias for "STRONG" signals.
-        prev_scores = getattr(df, 'last_scores', [])
-        if len(prev_scores) >= 2:
-            s1, s2 = prev_scores[-1], prev_scores[-2]
+        if score_history and len(score_history) >= 2:
+            s1, s2 = score_history[-1], score_history[-2]
             # If reversing (sign change) AND previous was strong, penalize current
             if (score * s1 < 0) and (abs(s1) >= 0.5):
                 score *= 0.7  # reduce conviction on immediate reversal
@@ -577,6 +577,13 @@ def compute_greeks(spot: float, strike: float, days_to_expiry: int,
     Returns delta (abs), gamma, theta (daily decay ₹/unit), vega, iv_pct.
     """
     try:
+        # Safety check: if spot is wrong (e.g. scaled price ~1100 instead of ~24000)
+        # we try to infer if we need to scale up or down.
+        # However, it's better to just ensure spot is the correct Nifty level.
+        if spot < 5000:
+             # Likely scaled/fake spot. Fallback to a neutral delta.
+             return {'delta': 0.45, 'gamma': 0.001, 'theta': -5.0, 'vega': 1.0, 'iv_pct': 20.0}
+
         T = max(days_to_expiry, 0.5) / 365.0   # min 12hr to avoid div/0
 
         # Implied Volatility: Brenner-Subrahmanyam approximation

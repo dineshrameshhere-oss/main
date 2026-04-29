@@ -197,7 +197,14 @@ def execute_scalp_trade(rating_score: float, direction: str,
     if   greeks['delta'] >= 0.45: greek_bonus = +0.08  # near ATM — good sensitivity
     elif greeks['delta'] >= 0.30: greek_bonus = +0.03
     elif greeks['delta'] <  0.15: greek_bonus = -0.10  # deep OTM — penalise
-    if rating_score + greek_bonus < RATING_STRONG_BUY * 0.90:
+    
+    # Check if Greek adjustment pulls score below execution threshold
+    # For SELL signals (negative score), we check if score + bonus is > -threshold
+    is_long = direction == 'SCALP_LONG'
+    effective_score = rating_score + (greek_bonus if is_long else -greek_bonus)
+    threshold = RATING_STRONG_BUY * 0.90
+    
+    if (is_long and effective_score < threshold) or (not is_long and effective_score > -threshold):
         log.warning(f"⚠️ Greek penalty pulls score below threshold — δ={greeks['delta']:.3f} | Skipping.")
         return
     log.info(f"  ✅ Greeks — δ={greeks['delta']:.3f} γ={greeks['gamma']:.5f} "
@@ -298,11 +305,9 @@ def scalp_poll():
     if not hasattr(state, 'score_history'):
         state.score_history = []
     
-    # Attach history to df for compute_multi_rating to see PREVIOUS scores
-    window_df.last_scores = state.score_history
-    
     rating = compute_multi_rating(window_df, rsi_window, adx_val, macd_w,
-                                   pcr=pcr_data, fnf_direction=fnf_dir, ivr_signal=ivr_sig)
+                                   pcr=pcr_data, fnf_direction=fnf_dir, ivr_signal=ivr_sig,
+                                   score_history=state.score_history)
     score  = rating['score']
     bd     = rating['breakdown']
     state.last_breakdown = bd   # stash for execute_scalp_trade OI log
