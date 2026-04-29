@@ -98,6 +98,15 @@ def calculate_rsi(series, period=14):
     return rsi.fillna(50)
 
 def run_backtest(initial_capital: float = 5000.0):
+    print("="*50)
+    print("⚠️  CRITICAL WARNING: SYNTHETIC BACKTEST ⚠️")
+    print("This backtest uses SYNTHETIC OTM premiums (ATM * 0.15).")
+    print("In reality, OTM premiums vary wildly with IV, theta, and delta.")
+    print("Real OTM options have massive slippage and liquidity risks.")
+    print("DO NOT rely on these numbers for live capital allocation.")
+    print("="*50)
+    
+    # ── 1. Load Data ────────────────────────────────────────────────────────
     print(f"Fetching 60 days of 5m Nifty data | Starting capital: Rs {initial_capital:.0f}")
     df = _fetch_5m_paginated(total_days=60, chunk_days=7)
 
@@ -211,19 +220,24 @@ def run_backtest(initial_capital: float = 5000.0):
                 
         # 1. Manage Open Trade
         if in_trade:
-            est_delta = min(0.8, max(0.2, current_premium_target / 300.0))
+            # ── OTM GREEKS: more realistic delta/theta for OTM options ─────────────
+            # ATM delta ~0.50. OTM delta scales with premium ratio.
+            est_delta = 0.50 * (current_premium_target / max(ATM_PREMIUM, 1))
+            # Cap delta to realistic ranges
+            est_delta = min(0.6, max(0.05, est_delta))
+            
             bars_held = i - entry_bar_idx
 
-            # ── THETA DECAY: realistic intraday option premium decay ─────────────
-            # Nifty ATM options lose ~3.5 Rs/day to time decay (theta)
-            # Distribute linearly across trading hours (9:15-15:30 = 6.25 hours)
+            # ── THETA DECAY: OTM options lose % value faster ─────────────
+            # ATM loses ~0.5-1% per day. OTM loses 2-5% per day.
             time_h = row.name.time().hour
             time_m = row.name.time().minute
             hours_into_day = (time_h - 9.25) + (time_m / 60.0)
-            hours_into_day = max(0, min(6.5, hours_into_day))  # clamp to [0, 6.5]
+            hours_into_day = max(0, min(6.5, hours_into_day))
             
-            theta_per_day = -3.5  # Rs/day realistic for ATM Nifty options (was -5.0)
-            cumulative_theta = theta_per_day * (hours_into_day / 6.5)  # theta so far today
+            theta_pct_per_day = -0.05 if current_premium_target < 100 else -0.02
+            cumulative_theta_pct = theta_pct_per_day * (hours_into_day / 6.5)
+            cumulative_theta_pts = cumulative_theta_pct * current_premium_target
             
             # ── GAMMA: positive acceleration for ATM option buyers ──────────────
             # Gamma reward: 0.5 × spot_move² × gamma_factor
@@ -243,8 +257,8 @@ def run_backtest(initial_capital: float = 5000.0):
             
             # Compute bar's best PnL% in option-premium terms
             # Premium move ≈ Nifty move × delta + gamma_acceleration + theta_decay
-            bar_best_pnl_pct  = ((best_nifty_move * est_delta) + best_gamma_pnl + cumulative_theta) / max(current_premium_target, 1)
-            bar_close_pnl_pct = ((close_nifty_move * est_delta) + close_gamma_pnl + cumulative_theta) / max(current_premium_target, 1)
+            bar_best_pnl_pct  = ((best_nifty_move * est_delta) + best_gamma_pnl + cumulative_theta_pts) / max(current_premium_target, 1)
+            bar_close_pnl_pct = ((close_nifty_move * est_delta) + close_gamma_pnl + cumulative_theta_pts) / max(current_premium_target, 1)
 
             # Track peak (for trailing SL ratchet)
             if bar_best_pnl_pct > peak_pnl_pct:
@@ -370,15 +384,21 @@ def run_backtest(initial_capital: float = 5000.0):
         # Bid-ask spread: OTM is less liquid, use 2% spread (vs 1% for ATM)
         entry_premium_with_spread = OTM_PREMIUM * 1.02  # 2% entry slip (OTM less liquid)
         
-        # Use FULL available capital (aggressive but with tight 5% SL)
-        MAX_BUDGET   = capital  # Deploy full account, not just 30%
-        qty          = max(1, int(MAX_BUDGET / entry_premium_with_spread))
+        # Use available capital (respecting LOT_SIZE)
+        MAX_BUDGET   = capital
+        num_lots     = int(MAX_BUDGET / (entry_premium_with_spread * LOT_SIZE))
+        if num_lots < 1:
+            prev_rating_score = score
+            continue
+            
+        qty          = num_lots * LOT_SIZE
         premium_target = entry_premium_with_spread
         
         if premium_target * qty > capital:
             # Scale back qty to fit budget
-            qty = max(1, int(capital / entry_premium_with_spread))
-            if qty * entry_premium_with_spread > capital:
+            num_lots = int(capital / (entry_premium_with_spread * LOT_SIZE))
+            qty = num_lots * LOT_SIZE
+            if qty <= 0:
                 continue
 
         # ── All filters passed — enter trade ────────────────────────────────
@@ -387,7 +407,7 @@ def run_backtest(initial_capital: float = 5000.0):
         trade_dir  = 1 if new_long else -1
         entry_price            = float(row['Close'])
         daily_trades           += 1
-        current_premium_target = ATM_PREMIUM
+        current_premium_target = OTM_PREMIUM
         current_qty            = qty
         entry_bar_idx          = i
         peak_pnl_pct           = 0.0
