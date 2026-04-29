@@ -1,5 +1,5 @@
 from .logger import log
-from .config import LOT_SIZE, MAX_TRADE_BUDGET, INDSTOCKS_BASE, PCR_BULLISH_MAX, PCR_BEARISH_MIN
+from .config import LOT_SIZE, INDSTOCKS_BASE, PCR_BULLISH_MAX, PCR_BEARISH_MIN
 from .market_data import fetch_ltp, get_auth_headers
 import requests
 import pandas as pd
