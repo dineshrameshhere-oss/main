@@ -201,7 +201,8 @@ def execute_scalp_trade(rating_score: float, direction: str,
     log.info(f"  ✅ Greeks — δ={greeks['delta']:.3f} γ={greeks['gamma']:.5f} "
              f"θ={greeks['theta']:.1f}₹/day IV={greeks['iv_pct']:.0f}% greek_bonus={greek_bonus:+.2f}")
 
-    qty, cost, _ = calculate_qty(current_balance, premium)
+    is_strong = abs(rating_score) >= 0.85
+    qty, cost, _ = calculate_qty(current_balance, premium, is_strong_conviction=is_strong)
     if qty == 0:
         log.warning(f"⚠️ Insufficient balance for 1 lot @ ₹{premium:.2f}.")
         return
@@ -275,6 +276,9 @@ def scalp_poll():
         return
 
     # ── Realized Volatility Gate (skip flat days) ───────────────────────
+    rv_gate = check_rv_gate(df)
+    if not rv_gate['ok']:
+        log.warning(f"⚠️ [Poll] RV Gate: Market too flat ({rv_gate['range_pct']}% < {rv_gate['required']}%). Skipping.")
         return
 
     # ── PCR + FinNifty + IVR (fetch once per poll cycle) ──────────────────
@@ -288,14 +292,11 @@ def scalp_poll():
     adx_val    = float(df['ADX'].iloc[-1]) if not df['ADX'].isna().all() else 20.0
     macd_w     = window_df['MACD_HIST']
 
-    # ── History for Anti-Whipsaw ───────────────────────────────────────
+    # ── History for Anti-Whipsaw (Attach previous scores) ──────────────
     if not hasattr(state, 'score_history'):
         state.score_history = []
-    state.score_history.append(score)
-    if len(state.score_history) > 10:
-        state.score_history.pop(0)
     
-    # Attach history to df for compute_multi_rating to see
+    # Attach history to df for compute_multi_rating to see PREVIOUS scores
     window_df.last_scores = state.score_history
     
     rating = compute_multi_rating(window_df, rsi_window, adx_val, macd_w,
@@ -303,6 +304,11 @@ def scalp_poll():
     score  = rating['score']
     bd     = rating['breakdown']
     state.last_breakdown = bd   # stash for execute_scalp_trade OI log
+
+    # Update history for NEXT poll
+    state.score_history.append(score)
+    if len(state.score_history) > 10:
+        state.score_history.pop(0)
 
     choppy_warn = " ⚠️CHOPPY" if bd.get('choppy') else ""
     oi_type     = bd.get('oi_coverage', '')

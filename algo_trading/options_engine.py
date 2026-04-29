@@ -342,10 +342,10 @@ def calculate_dynamic_risk(premium: float):
         return 0.05, 0.25   # ITM — tight SL, same TP
 
 
-def calculate_qty(budget: float, option_premium: float, lot_size: int = LOT_SIZE):
+def calculate_qty(budget: float, option_premium: float, is_strong_conviction: bool = False, lot_size: int = LOT_SIZE):
     """
     Calculates how many lots to buy based on budget and LOT_SCALE_TIERS.
-    Only returns multiple lots if conviction is STRONG_BUY (enforced by caller).
+    Only returns multiple lots if is_strong_conviction is True.
     Returns (qty, cost, lots).
     """
     if option_premium <= 0:
@@ -356,10 +356,11 @@ def calculate_qty(budget: float, option_premium: float, lot_size: int = LOT_SIZE
     
     # Find max affordable lots based on tier
     max_lots = 1
-    for tier_cap, tier_lots in sorted(LOT_SCALE_TIERS, key=lambda x: x[0], reverse=True):
-        if budget >= tier_cap:
-            max_lots = tier_lots
-            break
+    if is_strong_conviction:
+        for tier_cap, tier_lots in sorted(LOT_SCALE_TIERS, key=lambda x: x[0], reverse=True):
+            if budget >= tier_cap:
+                max_lots = tier_lots
+                break
     
     # Cap at what budget actually allows
     budget_lots = int(budget / cost_per_lot)

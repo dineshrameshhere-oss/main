@@ -382,7 +382,7 @@ def compute_multi_rating(
         vwap_val  = float(df["VWAP"].iloc[-1]) if "VWAP" in df.columns else close
         vwap_sig  = +1.0 if close > vwap_val * 1.001 else (-1.0 if close < vwap_val * 0.999 else 0.0)
         st_dir    = float(df["ST_Dir"].iloc[-1]) if "ST_Dir" in df.columns else 0
-        st_sig    = -st_sig_raw if (st_sig_raw := (-1.0 if st_dir == -1 else (+1.0 if st_dir == 1 else 0.0))) else 0.0
+        st_sig    = -st_dir  # st_dir: -1=bullish, +1=bearish -> st_sig: +1=bullish, -1=bearish
         ma_score  = (ema_cross_sig + ema9_sig + vwap_sig + st_sig) / 4.0
 
         # ── Structure (ORB) ───────────────────────────────────────────────────
