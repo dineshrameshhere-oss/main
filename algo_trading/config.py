@@ -39,9 +39,9 @@ TIME_PRE_MARKET   = "09:00"             # Step 1: historical context to LLM
 TIME_MARKET_OPEN  = "09:30"             # Step 3: first 30-min candle analysis
 TIME_EOD_CHECK    = "15:15"             # Close all open positions before expiry
 
-# ── SCALPING indicators (1-min / 3-min chart)
-EMA_FAST          = 5           # Changed from 9 to 5 for faster 5m entries
-EMA_SLOW          = 13          # Changed from 21 to 13 for faster 5m entries
+# ── SCALPING indicators (5-min chart) OTM MOMENTUM STRATEGY
+EMA_FAST          = 3           # Faster EMA for quick momentum detection
+EMA_SLOW          = 8           # Medium EMA for trend confirmation
 RSI_PERIOD        = 14
 RSI_OVERBOUGHT    = 75          # Relaxed slightly to not miss strong trends
 RSI_OVERSOLD      = 25          # Relaxed slightly to not miss strong trends
@@ -70,19 +70,19 @@ SWING_ADX_MIN        = 20
 SWING_RSI_BULL_MIN   = 50
 SWING_RSI_BEAR_MAX   = 50
 
-# Risk Defaults (Aggressive for Scalping)
-DEFAULT_SL_PCT      = 0.10              # Initial hard SL: 10% of premium paid
-DEFAULT_TP_PCT      = 0.08             # Initial TP: 8% (achievable — avg peak is +1.6% per trade)
-MAX_DAILY_LOSS_PCT  = 0.15              # Circuit breaker: stop trading if down 15% on the day
+# Risk Defaults (OTM HIGH-PROFIT Scalping)
+DEFAULT_SL_PCT      = 0.05              # Tight SL: 5% (cut losses fast on OTM)
+DEFAULT_TP_PCT      = 0.25             # 25% TP (realistic for OTM, +₹25-30 per ₹100 premium)
+MAX_DAILY_LOSS_PCT  = 0.20              # Circuit: stop if down 20% (loose for catching big moves)
 
-# ── Multi-Indicator Rating Thresholds ────────────────────────────────────────
-RATING_STRONG_BUY   = 0.45   # score >= +0.45 → STRONG_BUY (calibrated to normalised leading score)
-RATING_BUY          = 0.2    # score >= +0.2 → BUY
-RATING_STRONG_SELL  = -0.45  # score <= -0.45 → STRONG_SELL
-RATING_SELL         = -0.2   # score <= -0.2 → SELL
-VOLUME_MULT_SURGE   = 2.0    # Volume spike threshold for bonus score
-ADX_TREND_MIN       = 20     # ADX below this = choppy, halve all signals
-ADX_TREND_STRONG    = 25     # ADX above this = trending, normal signals
+# ── Multi-Indicator Rating Thresholds (OTM STRICT) ────────────────────────────────────────
+RATING_STRONG_BUY   = 0.55   # Raised: STRONG_BUY only (skip marginal signals)
+RATING_BUY          = 0.40   # Raised: fewer entries, higher quality
+RATING_STRONG_SELL  = -0.55  # Raised: STRONG_SELL only
+RATING_SELL         = -0.40  # Raised: higher threshold
+VOLUME_MULT_SURGE   = 2.5    # Raised: Volume surge 150%+ (high conviction)
+ADX_TREND_MIN       = 22     # Raised: Skip if too choppy
+ADX_TREND_STRONG    = 28     # Raised: Only strongest trends
 
 # ── Realized Volatility Gate ──────────────────────────────────────────────────
 # Skip all entries on flat days — if Nifty hasn't moved enough, premiums won't.
@@ -112,25 +112,22 @@ CANDLE_REJECTION_WICK = 2.0    # wick-to-body ratio above which = rejection cand
 MOMENTUM_BARS       = 6     # look-back bars (6 × 5min = 30 min)
 MOMENTUM_MIN_MOVE_PCT = 0.0005  # 0.05% net move in signal direction over 30 min
 
-# ── Stepped Trailing SL Ladder ────────────────────────────────────────────────
-# Calibrated to actual option move distribution (avg peak +1.6%, max ~15%).
-# Starts locking gains at just +3% so even small moves are captured.
+# ── Stepped Trailing SL Ladder (OTM SCALP) ────────────────────────────────────────────────
+# Aggressive step-ups for momentum spikes (faster ratcheting than ATM)
 # Each tuple: (profit_trigger_pct, locked_sl_floor_pct)
 # SL only moves UP — never down.
 TRAILING_STEPS = [
-    (0.03, 0.015),  # +3%  profit → lock in +1.5%  (covers ₹50 brokerage on ₹2000 trade)
-    (0.05, 0.025),  # +5%  profit → lock in +2.5%
-    (0.08, 0.04),   # +8%  profit → lock in +4%    (TP hit zone — guarantee profit)
-    (0.10, 0.06),   # +10% profit → lock in +6%
+    (0.10, 0.05),   # +10% profit → lock in +5%   (first momentum rung)
     (0.15, 0.08),   # +15% profit → lock in +8%
-    (0.20, 0.12),   # +20% profit → lock in +12%
+    (0.20, 0.12),   # +20% profit → lock in +12%  (PRIMARY TP ZONE — likely hit)
+    (0.25, 0.15),   # +25% profit → lock in +15%  (TARGET HIT — secure win)
     (0.30, 0.18),   # +30% profit → lock in +18%
-    (0.40, 0.24),   # +40% profit → lock in +24%
-    (0.50, 0.30),   # +50% profit → lock in +30%
+    (0.40, 0.25),   # +40% profit → lock in +25%
+    (0.50, 0.32),   # +50% profit → lock in +32%
     (0.75, 0.45),   # +75% profit → lock in +45%
     (1.00, 0.60),   # +100% profit → lock in +60%
     (1.50, 0.80),   # +150% profit → lock in +80%
-    (2.00, 1.00),   # +200% profit → lock in +100% (full entry recovered)
+    (2.00, 1.00),   # +200% profit → lock in +100%
 ]
 
 # Brokerage + API cost per round-trip (buy + sell)
