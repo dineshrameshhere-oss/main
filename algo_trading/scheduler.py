@@ -34,6 +34,7 @@ class BotState:
         self.active_position:    dict | None = None
         self.active_position_lock = threading.Lock()
         self.daily_trades:       int   = 0
+        self.consecutive_losses: int   = 0
         self.last_rating_score:  float = 0.0
         self.last_breakdown:     dict  = {}
 
@@ -134,11 +135,18 @@ def job_eod():
 # ─────────────────────────────────────────────────────────────────────────────
 #  MONITOR CALLBACK  — called by monitor thread when position closes
 # ─────────────────────────────────────────────────────────────────────────────
-def _on_position_closed():
+def _on_position_closed(pnl: float = 0.0):
     """Called by the monitor thread when a position is fully closed."""
     with state.active_position_lock:
         state.active_position = None
-    log.info("📭 Position cleared — bot ready for next signal.")
+        
+        # Track consecutive losses
+        if pnl < 0:
+            state.consecutive_losses += 1
+        else:
+            state.consecutive_losses = 0
+            
+    log.info(f"📭 Position cleared — bot ready for next signal. (Consecutive Losses: {state.consecutive_losses})")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -255,6 +263,11 @@ def scalp_poll():
     if in_trade:
         return
 
+    # ── Circuit Breaker: Consecutive Losses ─────────────────────────────
+    if state.consecutive_losses >= 2:
+        log.warning(f"🚫 Circuit breaker active: {state.consecutive_losses} consecutive losses. Trading stopped for today.")
+        return
+
     # ── Fetch data & compute rating ─────────────────────────────────────
     df = _get_enriched_df()
     if df is None or df.empty:
@@ -275,6 +288,16 @@ def scalp_poll():
     adx_val    = float(df['ADX'].iloc[-1]) if not df['ADX'].isna().all() else 20.0
     macd_w     = window_df['MACD_HIST']
 
+    # ── History for Anti-Whipsaw ───────────────────────────────────────
+    if not hasattr(state, 'score_history'):
+        state.score_history = []
+    state.score_history.append(score)
+    if len(state.score_history) > 10:
+        state.score_history.pop(0)
+    
+    # Attach history to df for compute_multi_rating to see
+    window_df.last_scores = state.score_history
+    
     rating = compute_multi_rating(window_df, rsi_window, adx_val, macd_w,
                                    pcr=pcr_data, fnf_direction=fnf_dir, ivr_signal=ivr_sig)
     score  = rating['score']
@@ -297,16 +320,34 @@ def scalp_poll():
 
     # Afternoon safety net: if 0 trades by 12:30, relax threshold slightly
     _strong_thresh = RATING_STRONG_BUY
+    
+    # ── Morning Volatility Buffer (09:35 - 10:00) ────────────────────────
+    # Require higher conviction during the chaotic opening period.
+    is_morning = (9 * 60 + 35) <= now_hm <= (10 * 60 + 0)
+    if is_morning:
+        _strong_thresh = 0.85  # Strict threshold for morning entries
+        log.debug(f"Morning Volatility Buffer: threshold raised to {_strong_thresh}")
+
     if (state.daily_trades == 0
             and now.hour > AFTERNOON_HOUR
             or (now.hour == AFTERNOON_HOUR and now.minute >= AFTERNOON_MIN)):
         _strong_thresh = RATING_AFTERNOON_RELAXED
         log.debug(f"Afternoon relaxed threshold: {_strong_thresh} (0 trades today)")
 
+    # ── LLM Bias Filter ──────────────────────────────────────────────────
+    # If Gemini pre-market analysis is STRONG BULLISH/BEARISH, we only trade in that direction.
+    premarket_bias = state.premarket_analysis.get('strategy_suggestion', 'WAIT')
+    
     if score >= _strong_thresh and prev_score < _strong_thresh:
+        if premarket_bias == 'BEARISH':
+            log.warning(f"⚠️ STRONG BUY blocked by LLM BEARISH bias ({premarket_bias})")
+            return
         log.info(f"🟢 STRONG BUY crossed +{RATING_STRONG_BUY} → Buy CE")
         execute_scalp_trade(score, 'SCALP_LONG', df_enriched=df, pcr=pcr_data)
     elif score <= -_strong_thresh and prev_score > -_strong_thresh:
+        if premarket_bias == 'BULLISH':
+            log.warning(f"⚠️ STRONG SELL blocked by LLM BULLISH bias ({premarket_bias})")
+            return
         log.info(f"🔴 STRONG SELL crossed {RATING_STRONG_SELL} → Buy PE")
         execute_scalp_trade(score, 'SCALP_SHORT', df_enriched=df, pcr=pcr_data)
 

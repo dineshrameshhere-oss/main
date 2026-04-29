@@ -488,6 +488,18 @@ def compute_multi_rating(
         #  0.00: IVR 25-75 or API unavailable             → no effect
         score = score + float(ivr_signal)
 
+        # ── TREND CONSISTENCY (Cooldown / Anti-Whipsaw) ──────────────────────
+        # Check if we are reversing direction too fast.
+        # If we had a STRONG SELL in the last 15 mins and now have a STRONG BUY,
+        # it might be a volatility trap.
+        # We require at least 2 consecutive bars of consistent bias for "STRONG" signals.
+        prev_scores = getattr(df, 'last_scores', [])
+        if len(prev_scores) >= 2:
+            s1, s2 = prev_scores[-1], prev_scores[-2]
+            # If reversing (sign change) AND previous was strong, penalize current
+            if (score * s1 < 0) and (abs(s1) >= 0.5):
+                score *= 0.7  # reduce conviction on immediate reversal
+        
         # ── Rating assignment ─────────────────────────────────────────────────
         choppy    = adx_val < 20
         no_volume = not volume_ok

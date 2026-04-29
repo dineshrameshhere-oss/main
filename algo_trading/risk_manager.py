@@ -73,7 +73,7 @@ def monitor_position(order: dict, live: bool = False,
             f"[{order_id}] Security ID is a dummy ({security_id}). "
             f"Cannot monitor — no live LTP available."
         )
-        if on_close: on_close()
+        if on_close: on_close(0.0)
         return
 
     # Tracking state
@@ -104,7 +104,7 @@ def monitor_position(order: dict, live: bool = False,
             if zero_ltp_retries >= _LTP_ZERO_MAX_RETRIES:
                 log.error(f"[{order_id}] LTP unavailable after {_LTP_ZERO_MAX_RETRIES} retries — force-closing.")
                 close_order(order_id, "LTP_UNAVAILABLE", pnl=0.0, live=live)
-                if on_close: on_close()
+                if on_close: on_close(0.0)
                 return
             continue
         zero_ltp_retries = 0
@@ -160,7 +160,7 @@ def monitor_position(order: dict, live: bool = False,
                 f"| Locked {current_sl_floor*100:+.0f}% | PnL ₹{pnl_amount:+.0f}"
             )
             close_order(order_id, reason, pnl=pnl_amount, live=live)
-            if on_close: on_close()
+            if on_close: on_close(pnl_amount)
             return
 
         # ── 3. DAILY LOSS CIRCUIT BREAKER ─────────────────────────────────────
@@ -171,7 +171,7 @@ def monitor_position(order: dict, live: bool = False,
                 f"exceeds {MAX_DAILY_LOSS_PCT*100:.0f}% circuit breaker."
             )
             close_order(order_id, "DAILY_LOSS_LIMIT", pnl=pnl_amount, live=live)
-            if on_close: on_close()
+            if on_close: on_close(pnl_amount)
             return
 
     # ── 4. 60-MINUTE MAX HOLD REACHED ─────────────────────────────────────────
@@ -184,4 +184,4 @@ def monitor_position(order: dict, live: bool = False,
         f"Exit ₹{final_premium:.2f} | PnL ₹{final_pnl:+.0f}"
     )
     close_order(order_id, "TIME_LIMIT_EXIT", pnl=final_pnl, live=live)
-    if on_close: on_close()
+    if on_close: on_close(final_pnl)
