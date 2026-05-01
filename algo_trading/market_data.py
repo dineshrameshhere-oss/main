@@ -137,6 +137,49 @@ def fetch_first_30min_candle():
         }
     return {}
 
+def is_market_holiday(date_obj=None) -> tuple[bool, str]:
+    """
+    Checks if today is a market holiday using a direct, lightweight check.
+    First checks weekends, then uses a public holiday API for India.
+    """
+    import requests
+    from datetime import datetime, timezone, timedelta
+    
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now = datetime.now(IST)
+    if date_obj is None:
+        date_obj = now.date()
+    
+    # 1. Weekend Check (Sat=5, Sun=6)
+    if date_obj.weekday() >= 5:
+        # Check for special Saturday sessions (Budget, Muhurat)
+        special_dates = {
+            "2026-02-01": "Union Budget Special Session",
+            "2026-11-08": "Muhurat Trading"
+        }
+        ds = date_obj.strftime("%Y-%m-%d")
+        if ds in special_dates:
+            return False, special_dates[ds]
+        return True, "Weekend"
+
+    # 2. Direct API Check (Public Holidays India)
+    # Using Nager.Date (free, no key required)
+    try:
+        year = date_obj.year
+        url = f"https://date.nager.at/api/v3/PublicHolidays/{year}/IN"
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 200:
+            holidays = resp.json()
+            ds = date_obj.strftime("%Y-%m-%d")
+            for h in holidays:
+                if h['date'] == ds:
+                    # Filter for typical stock market holidays (Central/Bank)
+                    return True, h['localName']
+    except Exception as e:
+        log.warning(f"Holiday API failed: {e}. Falling back to timestamp check.")
+    
+    return False, "Trading Day"
+
 def fetch_ltp(scrip_code=NIFTY_SCRIP_CODE):
     """
     Fetch Last Traded Price directly from INDMoney API with retry/timeout.

@@ -11,7 +11,8 @@ from .config import (
     SUPERTREND_PERIOD, SUPERTREND_MULT, RSI_PERIOD)
 from .market_data import (fetch_historical_ohlcv, compress_ohlcv_to_string,
                            fetch_first_30min_candle, fetch_intraday_data,
-                           fetch_finnifty_direction, fetch_iv_rank, resample_ohlcv)
+                           fetch_finnifty_direction, fetch_iv_rank, resample_ohlcv,
+                           is_market_holiday)
 from .news_fetcher import fetch_nifty_news
 from .indicators import (
     compute_key_levels, compute_supertrend, compute_adx_series,
@@ -39,8 +40,25 @@ class BotState:
         self.consecutive_losses: int   = 0
         self.last_rating_score:  float = 0.0
         self.last_breakdown:     dict  = {}
+        self.market_status:      dict  = {"is_open": True, "reason": "Not checked", "date": None}
 
 state = BotState()
+
+def _check_market_open_dynamic():
+    """
+    Checks if market is open today using a fast, direct API check.
+    """
+    today = datetime.now(IST).date()
+    if state.market_status["date"] == today:
+        return not state.market_status["is_open"], state.market_status["reason"]
+    
+    is_holiday, reason = is_market_holiday()
+    state.market_status = {
+        "is_open": not is_holiday,
+        "reason": reason,
+        "date": today
+    }
+    return is_holiday, reason
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -49,11 +67,47 @@ state = BotState()
 def _get_enriched_df():
     """Fetch 1m intraday data and resample to 3m, 5m, 15m for MTF analysis."""
     import pandas as pd
+    from datetime import datetime
 
     # Fetch 1m data (base for all resampling)
     df_1m = fetch_intraday_data(interval='1minute', days_back=2)
     if df_1m is None or df_1m.empty:
         return None, None, None, None
+
+    # ── STALE DATA / HOLIDAY CHECK ──────────────────────────────────────────
+    # Check official holiday calendar first (via Dynamic Google Search)
+    is_holiday, reason = _check_market_open_dynamic()
+    if is_holiday:
+        log.warning(f"🚫 Market is CLOSED today: {reason}. Skipping poll.")
+        return None, None, None, None
+
+    # Fallback to data timestamp check
+    now_ist = datetime.now(IST)
+    latest_ts = df_1m.index[-1]
+    
+    # If timestamp doesn't have tz, assume it's UTC from API and convert to IST
+    if latest_ts.tzinfo is None:
+        latest_ts = pd.to_datetime(latest_ts, utc=True).tz_convert(IST).tz_localize(None)
+    else:
+        latest_ts = latest_ts.astimezone(IST).replace(tzinfo=None)
+
+    # If the latest data is more than 15 minutes old during market hours, it's stale.
+    # If the latest data is from yesterday, it's a holiday/weekend.
+    if latest_ts.date() < now_ist.date():
+        log.warning(f"🚫 Market appears CLOSED/HOLIDAY. Latest data is from {latest_ts.date()}.")
+        return None, None, None, None
+
+    # Check for excessive API lag (more than 15 mins) during active hours
+    if (now_ist - latest_ts).total_seconds() > 15 * 60:
+        log.warning(f"⚠️ API data is lagging by {(now_ist - latest_ts).total_seconds()/60:.0f} mins. Skipping for safety.")
+        return None, None, None, None
+        
+    # Check for frozen price (zero volatility over last 5 bars)
+    if len(df_1m) > 5:
+        last_5 = df_1m.iloc[-5:]
+        if last_5['Close'].max() == last_5['Close'].min():
+            log.warning("⚠️ Market data is FROZEN (no price movement). Skipping poll.")
+            return None, None, None, None
 
     # IST conversion
     if df_1m.index.tzinfo is None:
@@ -101,6 +155,13 @@ def _get_enriched_df():
 # ─────────────────────────────────────────────────────────────────────────────
 def job_premarket():
     log.info("\n[09:00] 📊 Pre-market scan starting...")
+    
+    # ── Market Availability Check (Dynamic Search) ──────────────────────────
+    is_holiday, reason = _check_market_open_dynamic()
+    if is_holiday:
+        log.warning(f"🚫 Market is CLOSED today: {reason}. Bot will remain idle.")
+        return
+
     try:
         historical = fetch_historical_ohlcv()
         df_1h      = historical.get('1h')
