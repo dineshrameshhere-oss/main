@@ -326,6 +326,38 @@ def _stoch_rsi_signal(rsi_series: pd.Series, period: int = 14) -> float:
     if stoch_rsi > 70:  return -1.0   # overbought → sell signal
     return 0.0
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  MULTI-TIMEFRAME (MTF) TREND
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_mtf_trend_score(df_3m: pd.DataFrame, df_5m: pd.DataFrame, df_15m: pd.DataFrame) -> float:
+    """
+    Computes a trend confirmation score across 3m, 5m, and 15m timeframes.
+    Each timeframe contributes to the score based on EMA and SuperTrend alignment.
+    
+    Returns: -1.0 to +1.0 (Full Bearish to Full Bullish)
+    """
+    def get_tf_signal(df):
+        if df is None or df.empty: return 0.0
+        try:
+            close = df['Close'].iloc[-1]
+            ema9  = df['Close'].ewm(span=9, adjust=False).mean().iloc[-1]
+            st_dir = compute_supertrend(df).iloc[-1] # -1 bullish, +1 bearish
+            
+            sig = 0.0
+            if close > ema9: sig += 0.5
+            else: sig -= 0.5
+            
+            if st_dir == -1: sig += 0.5
+            else: sig -= 0.5
+            return sig
+        except: return 0.0
+
+    s3  = get_tf_signal(df_3m)  # weight 0.2
+    s5  = get_tf_signal(df_5m)  # weight 0.3
+    s15 = get_tf_signal(df_15m) # weight 0.5 (highest weight for HTF)
+    
+    return (s3 * 0.2) + (s5 * 0.3) + (s15 * 0.5)
+
 def compute_multi_rating(
     df: pd.DataFrame,
     rsi_series: pd.Series,
@@ -335,19 +367,22 @@ def compute_multi_rating(
     fnf_direction: float = 0.0,
     ivr_signal: float = 0.0,
     score_history: list | None = None,
+    mtf_score: float = 0.0,
 ) -> dict:
     """
-    Proven composite scoring (5 components) with two upgrades:
+    Proven composite scoring (6 components) with upgrades:
+      + MTF Trend Confirmation [−1.0..+1.0] — weight 1.2 (HIGH CONVICTION)
       + Consensus multiplier [0.88..1.00] — suppresses signals where most indicators
         disagree strongly (anti-false-signal for leading indicators)
       + FinNifty addend [−0.20..+0.20] — financial sector confirmation
 
-    Core components (same as the version that yielded 116 trades / +12.3%):
-      1. Oscillators  (RSI + StochRSI + MACD)   weight 0.7   — timing
-      2. Moving Avgs  (EMA5/13 + EMA9 + VWAP + SuperTrend) weight 0.9 — trend
-      3. Structure    (ORB breakout)              weight 1.0   — breakout
-      4. OI Coverage  (4-type smart-money flow)  weight 1.1   — conviction
-      5. PCR          (options sentiment)         weight 0.4   — macro bias
+    Core components:
+      1. Oscillators  (RSI + StochRSI + MACD)   weight 0.7
+      2. Moving Avgs  (EMA5/13 + EMA9 + VWAP + SuperTrend) weight 0.9
+      3. Structure    (ORB breakout)              weight 1.0
+      4. OI Coverage  (4-type smart-money flow)  weight 1.1
+      5. PCR          (options sentiment)         weight 0.4
+      6. MTF Trend    (3m, 5m, 15m alignment)     weight 1.2
 
     Consensus (anti-false-signal layer):
       Counts leading indicators (Stoch-K, WR, ROC, Volume, Candle) that strongly
@@ -424,7 +459,8 @@ def compute_multi_rating(
             ma_score        * 0.9 +
             structure_score * 1.0 +
             oi_score        * 1.1 +
-            pcr_score       * 0.4
+            pcr_score       * 0.4 +
+            mtf_score       * 1.2
         )
 
         # ── ADX multiplier ────────────────────────────────────────────────────
@@ -653,7 +689,10 @@ def compute_scalp_signals(df: pd.DataFrame) -> dict:
         if 'ORB_HIGH' not in df.columns:
             df = compute_orb_series(df)
 
-        rating = compute_multi_rating(df, rsi_series, adx_val, macd_hist)
+        # MTF Trend fallback (using 5m as base for all if not provided)
+        mtf_score = compute_mtf_trend_score(df, df, df)
+
+        rating = compute_multi_rating(df, rsi_series, adx_val, macd_hist, mtf_score=mtf_score)
 
         direction_map = {
             "STRONG_BUY":  "SCALP_LONG",

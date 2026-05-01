@@ -98,9 +98,25 @@ def compress_ohlcv_to_string(df, timeframe, n_candles=5):
         
     return "\n".join(lines)
 
+def resample_ohlcv(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+    """
+    Resamples OHLCV data to a higher timeframe.
+    Interval example: '3min', '5min', '15min'
+    """
+    if df is None or df.empty: return pd.DataFrame()
+    
+    resampled = df.resample(interval).agg({
+        'Open': 'first',
+        'High': 'max',
+        'Low': 'min',
+        'Close': 'last',
+        'Volume': 'sum'
+    }).dropna()
+    return resampled
+
 def fetch_intraday_data(interval='5minute', days_back=1):
     """
-    Fetches 5m intraday data directly from INDMoney for SCALP.
+    Fetches intraday data directly from INDMoney for SCALP.
     """
     return _fetch_indstocks_chart(interval=interval, days_back=days_back)
 

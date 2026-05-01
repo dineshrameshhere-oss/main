@@ -11,12 +11,12 @@ from .config import (
     SUPERTREND_PERIOD, SUPERTREND_MULT, RSI_PERIOD)
 from .market_data import (fetch_historical_ohlcv, compress_ohlcv_to_string,
                            fetch_first_30min_candle, fetch_intraday_data,
-                           fetch_finnifty_direction, fetch_iv_rank)
+                           fetch_finnifty_direction, fetch_iv_rank, resample_ohlcv)
 from .news_fetcher import fetch_nifty_news
 from .indicators import (
     compute_key_levels, compute_supertrend, compute_adx_series,
     compute_macd_hist_series, compute_orb_series, compute_multi_rating,
-    compute_greeks, check_rv_gate
+    compute_greeks, check_rv_gate, compute_mtf_trend_score
 )
 from .llm_analyst import analyze_premarket, analyze_market_open
 from .options_engine import select_strike, calculate_qty, calculate_dynamic_risk, compute_pcr
@@ -47,45 +47,53 @@ state = BotState()
 #  LIVE DATA HELPER
 # ─────────────────────────────────────────────────────────────────────────────
 def _get_enriched_df():
-    """Fetch 5m intraday data and compute all indicator columns."""
+    """Fetch 1m intraday data and resample to 3m, 5m, 15m for MTF analysis."""
     import pandas as pd
 
-    df = fetch_intraday_data(interval='5minute', days_back=2)
-    if df is None or df.empty:
-        return None
+    # Fetch 1m data (base for all resampling)
+    df_1m = fetch_intraday_data(interval='1minute', days_back=2)
+    if df_1m is None or df_1m.empty:
+        return None, None, None, None
 
-    df = df.dropna()
-    if len(df) < 30:
-        log.warning("Enriched DF too short (<30 bars). Skipping.")
-        return None
-
-    # IST conversion (no tzdata needed)
-    if df.index.tzinfo is None:
-        df.index = (
-            pd.to_datetime(df.index, utc=True)
+    # IST conversion
+    if df_1m.index.tzinfo is None:
+        df_1m.index = (
+            pd.to_datetime(df_1m.index, utc=True)
             .tz_convert(IST)
             .tz_localize(None)
         )
 
-    # VWAP (daily reset)
-    df['TradeDate'] = df.index.date
-    tp = (df['High'] + df['Low'] + df['Close']) / 3
-    df['VWAP'] = (
-        (tp * df['Volume']).groupby(df['TradeDate']).cumsum()
-        / df['Volume'].groupby(df['TradeDate']).cumsum()
-    )
+    # Resample to needed timeframes
+    df_3m  = resample_ohlcv(df_1m, '3min')
+    df_5m  = resample_ohlcv(df_1m, '5min')
+    df_15m = resample_ohlcv(df_1m, '15min')
 
-    df['ST_Dir']    = compute_supertrend(df, period=SUPERTREND_PERIOD, mult=SUPERTREND_MULT)
-    df['ADX']       = compute_adx_series(df, period=14)
-    df['MACD_HIST'] = compute_macd_hist_series(df)
+    def add_indicators(df):
+        if df.empty: return df
+        df = df.copy()
+        df['TradeDate'] = df.index.date
+        tp = (df['High'] + df['Low'] + df['Close']) / 3
+        df['VWAP'] = (
+            (tp * df['Volume']).groupby(df['TradeDate']).cumsum()
+            / df['Volume'].groupby(df['TradeDate']).cumsum()
+        )
+        df['ST_Dir']    = compute_supertrend(df, period=SUPERTREND_PERIOD, mult=SUPERTREND_MULT)
+        df['ADX']       = compute_adx_series(df, period=14)
+        df['MACD_HIST'] = compute_macd_hist_series(df)
 
-    rsi_delta = df['Close'].diff()
-    rsi_gain  = rsi_delta.where(rsi_delta > 0, 0).ewm(com=RSI_PERIOD-1, adjust=False).mean()
-    rsi_loss  = (-rsi_delta.where(rsi_delta < 0, 0)).ewm(com=RSI_PERIOD-1, adjust=False).mean()
-    df['RSI'] = (100 - (100 / (1 + rsi_gain / rsi_loss.replace(0, 1e-9)))).fillna(50)
+        rsi_delta = df['Close'].diff()
+        rsi_gain  = rsi_delta.where(rsi_delta > 0, 0).ewm(com=RSI_PERIOD-1, adjust=False).mean()
+        rsi_loss  = (-rsi_delta.where(rsi_delta < 0, 0)).ewm(com=RSI_PERIOD-1, adjust=False).mean()
+        df['RSI'] = (100 - (100 / (1 + rsi_gain / rsi_loss.replace(0, 1e-9)))).fillna(50)
+        
+        df = compute_orb_series(df)
+        return df
 
-    df = compute_orb_series(df)
-    return df
+    df_3m  = add_indicators(df_3m)
+    df_5m  = add_indicators(df_5m)
+    df_15m = add_indicators(df_15m)
+
+    return df_3m, df_5m, df_15m, df_1m
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -167,7 +175,11 @@ def execute_scalp_trade(rating_score: float, direction: str,
         return
 
     # Use already-fetched df from poll — no double API call
-    df = df_enriched if (df_enriched is not None and not df_enriched.empty) else _get_enriched_df()
+    if df_enriched is not None and not df_enriched.empty:
+        df = df_enriched
+    else:
+        _, df, _, _ = _get_enriched_df()
+
     if df is None or df.empty:
         log.error("❌ No live data for trade execution.")
         return
@@ -279,13 +291,13 @@ def scalp_poll():
         return
 
     # ── Fetch data & compute rating ─────────────────────────────────────
-    df = _get_enriched_df()
-    if df is None or df.empty:
+    df_3m, df_5m, df_15m, df_1m = _get_enriched_df()
+    if df_5m is None or df_5m.empty:
         log.warning("⚠️ [Poll] No live data. Retry next cycle.")
         return
 
     # ── Realized Volatility Gate (skip flat days) ───────────────────────
-    rv_gate = check_rv_gate(df)
+    rv_gate = check_rv_gate(df_5m)
     if not rv_gate['ok']:
         log.warning(f"⚠️ [Poll] RV Gate: Market too flat ({rv_gate['range_pct']}% < {rv_gate['required']}%). Skipping.")
         return
@@ -295,10 +307,13 @@ def scalp_poll():
     fnf_dir     = fetch_finnifty_direction()   # 0.0 on error (safe neutral)
     ivr_data    = fetch_iv_rank()              # {'ivr':50,'iv':0,'signal':0.0} on error
     ivr_sig     = ivr_data.get('signal', 0.0)
+    
+    # ── MTF Trend Confirmation ──────────────────────────────────────────
+    mtf_score = compute_mtf_trend_score(df_3m, df_5m, df_15m)
 
-    window_df  = df.iloc[-50:].copy()
+    window_df  = df_5m.iloc[-50:].copy()
     rsi_window = window_df['RSI']
-    adx_val    = float(df['ADX'].iloc[-1]) if not df['ADX'].isna().all() else 20.0
+    adx_val    = float(df_5m['ADX'].iloc[-1]) if not df_5m['ADX'].isna().all() else 20.0
     macd_w     = window_df['MACD_HIST']
 
     # ── History for Anti-Whipsaw (Attach previous scores) ──────────────
@@ -307,7 +322,7 @@ def scalp_poll():
     
     rating = compute_multi_rating(window_df, rsi_window, adx_val, macd_w,
                                    pcr=pcr_data, fnf_direction=fnf_dir, ivr_signal=ivr_sig,
-                                   score_history=state.score_history)
+                                   score_history=state.score_history, mtf_score=mtf_score)
     score  = rating['score']
     bd     = rating['breakdown']
     state.last_breakdown = bd   # stash for execute_scalp_trade OI log
@@ -322,7 +337,7 @@ def scalp_poll():
     pcr_txt     = f" PCR:{bd.get('pcr_val',1.0):.2f}" if 'pcr_val' in bd else ""
     log.info(
         f"[{now.strftime('%H:%M')}] Sigma {rating['rating']} ({score:+.2f}) | "
-        f"ADX:{bd.get('adx',0):.0f}{choppy_warn} RSI:{bd.get('rsi',0):.0f} "
+        f"MTF:{mtf_score:+.2f} ADX:{bd.get('adx',0):.0f}{choppy_warn} RSI:{bd.get('rsi',0):.0f} "
         f"ORB:{bd.get('structure_orb',0):+.0f} OI:{oi_type}{pcr_txt} "
         f"IVR:{ivr_data.get('ivr',50):.0f}({ivr_sig:+.2f}) "
         f"Vol:{'OK' if bd.get('volume_confirm') else 'NO'} Trades:{state.daily_trades}/3"
@@ -356,13 +371,13 @@ def scalp_poll():
             log.warning(f"⚠️ STRONG BUY blocked by LLM BEARISH bias ({premarket_bias})")
             return
         log.info(f"🟢 STRONG BUY crossed +{RATING_STRONG_BUY} → Buy CE")
-        execute_scalp_trade(score, 'SCALP_LONG', df_enriched=df, pcr=pcr_data)
+        execute_scalp_trade(score, 'SCALP_LONG', df_enriched=df_5m, pcr=pcr_data)
     elif score <= -_strong_thresh and prev_score > -_strong_thresh:
         if premarket_bias == 'BULLISH':
             log.warning(f"⚠️ STRONG SELL blocked by LLM BULLISH bias ({premarket_bias})")
             return
         log.info(f"🔴 STRONG SELL crossed {RATING_STRONG_SELL} → Buy PE")
-        execute_scalp_trade(score, 'SCALP_SHORT', df_enriched=df, pcr=pcr_data)
+        execute_scalp_trade(score, 'SCALP_SHORT', df_enriched=df_5m, pcr=pcr_data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
