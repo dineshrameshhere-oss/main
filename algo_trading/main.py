@@ -7,50 +7,53 @@ from .scheduler import start_scheduler
 from .trade_executor import get_balance
 
 
-def print_banner(live_mode: bool = False, is_intraday: bool = False):
+def print_banner(live_mode: bool = False, is_intraday: bool = False, use_ai: bool = False):
     load_dotenv()   # ensure env is loaded before reading balance
     balance  = get_balance(live=live_mode)
     mode_str = '🔴 LIVE TRADING' if live_mode else '🟢 PAPER TRADING'
     bot_type = 'DEEP LEARNING INTRADAY' if is_intraday else 'OPTIONS SCALPING'
+    ai_status = 'Enabled' if use_ai else 'Disabled'
     
     print('\033[96m' + '='*52)
     print(f'  🚀 NIFTY 50 {bot_type} BOT')
     print('='*52 + '\033[0m')
     print(f'  Mode    : {mode_str}')
     print(f'  Balance : ₹{balance:.2f}')
-    print(f'  AI      : Google Gemini 2.0-Flash')
+    print(f'  AI      : {ai_status}')
     print('='*52)
 
 
 def main():
     load_dotenv()
 
+    use_ai = '--ai' in sys.argv
+
     if '--startScalp' in sys.argv:
-        print_banner(live_mode=False, is_intraday=False)
-        log.info('⚡ --startScalp: Paper mode auto-starting...')
-        start_scheduler(live_mode=False)
+        print_banner(live_mode=False, is_intraday=False, use_ai=use_ai)
+        log.info(f'⚡ --startScalp: Paper mode auto-starting... (AI: {use_ai})')
+        start_scheduler(live_mode=False, use_ai=use_ai)
         return
         
     if '--startIntraday' in sys.argv:
         from algo_trading.intraday_scheduler import start_intraday_scheduler
-        print_banner(live_mode=False, is_intraday=True)
-        log.info('🧠 --startIntraday: DL Intraday Paper mode auto-starting...')
-        start_intraday_scheduler(live_mode=False)
+        print_banner(live_mode=False, is_intraday=True, use_ai=use_ai)
+        log.info(f'🧠 --startIntraday: DL Intraday Paper mode auto-starting... (AI: {use_ai})')
+        start_intraday_scheduler(live_mode=False, use_ai=use_ai)
         return
 
     if '--live' in sys.argv:
         is_intraday = '--intraday' in sys.argv
-        print_banner(live_mode=True, is_intraday=is_intraday)
+        print_banner(live_mode=True, is_intraday=is_intraday, use_ai=use_ai)
         confirm = input('⚠️  TYPE "YES-LIVE" TO CONFIRM REAL MONEY TRADING: ').strip()
         if confirm != 'YES-LIVE':
             print('Aborted. Start again without --live for paper mode.')
             return
-        log.warning('🔴 LIVE TRADING MODE ENGAGED.')
+        log.warning(f'🔴 LIVE TRADING MODE ENGAGED. (AI: {use_ai})')
         if is_intraday:
             from algo_trading.intraday_scheduler import start_intraday_scheduler
-            start_intraday_scheduler(live_mode=True)
+            start_intraday_scheduler(live_mode=True, use_ai=use_ai)
         else:
-            start_scheduler(live_mode=True)
+            start_scheduler(live_mode=True, use_ai=use_ai)
         return
 
     # Interactive mode

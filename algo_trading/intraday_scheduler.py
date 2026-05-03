@@ -112,14 +112,19 @@ def execute_intraday_trade(df, direction, score, rating):
         log.error("❌ Order placement failed.")
 
 
-def start_intraday_scheduler(live_mode=True):
+def start_intraday_scheduler(live_mode=True, use_ai=False):
     """
     Initialises the 15-minute schedule for the Intraday bot.
     """
+    state.live_mode = live_mode
+    state.use_ai = use_ai
     mode = "🔴 LIVE TRADING" if live_mode else "🟢 PAPER TRADING"
+    ai_str = "Enabled" if use_ai else "Disabled (Defaulting to basic indicators)"
+    
     log.info("=" * 60)
     log.info(f"  🧠 INTRADAY DL OPTIONS BOT")
     log.info(f"  Mode      : {mode}")
+    log.info(f"  AI Features: {ai_str}")
     log.info(f"  Interval  : {INTRADAY_POLL_INTERVAL_MIN} minutes")
     log.info("=" * 60)
 

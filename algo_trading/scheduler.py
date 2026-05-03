@@ -30,10 +30,13 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # ─────────────────────────────────────────────────────────────────────────────
 #  BOT STATE  (single shared instance — no class-level mutable defaults)
 # ─────────────────────────────────────────────────────────────────────────────
+STATE_FILE = os.path.join(_BASE_DIR, 'bot_state.json')
+
 class BotState:
     def __init__(self):
         self.premarket_analysis: dict  = {}
         self.live_mode:          bool  = False
+        self.use_ai:             bool  = False
         self.active_position:    dict | None = None
         self.active_position_lock = threading.Lock()
         self.daily_trades:       int   = 0
@@ -41,6 +44,49 @@ class BotState:
         self.last_rating_score:  float = 0.0
         self.last_breakdown:     dict  = {}
         self.market_status:      dict  = {"is_open": True, "reason": "Not checked", "date": None}
+        self.last_loss_time:     datetime | None = None
+        self.last_loss_dir:      str | None = None
+        self.load_state()
+
+    def save_state(self):
+        """Persists critical state to disk to survive Termux/system restarts."""
+        try:
+            data = {
+                "daily_trades":       self.daily_trades,
+                "consecutive_losses": self.consecutive_losses,
+                "active_position":    self.active_position,
+                "last_loss_time":     self.last_loss_time.isoformat() if self.last_loss_time else None,
+                "last_loss_dir":      self.last_loss_dir,
+                "date":               datetime.now(IST).strftime("%Y-%m-%d")
+            }
+            with open(STATE_FILE, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            log.error(f"Error saving state: {e}")
+
+    def load_state(self):
+        """Loads state from disk if it belongs to the current trading day."""
+        if not os.path.exists(STATE_FILE):
+            return
+        try:
+            with open(STATE_FILE, 'r') as f:
+                data = json.load(f)
+            
+            # Only load if it's from today
+            today = datetime.now(IST).strftime("%Y-%m-%d")
+            if data.get("date") == today:
+                self.daily_trades       = data.get("daily_trades", 0)
+                self.consecutive_losses = data.get("consecutive_losses", 0)
+                self.active_position    = data.get("active_position")
+                self.last_loss_dir      = data.get("last_loss_dir")
+                ltime = data.get("last_loss_time")
+                if ltime:
+                    self.last_loss_time = datetime.fromisoformat(ltime)
+                log.info(f"🔄 State recovered: {self.daily_trades} trades, {self.consecutive_losses} losses.")
+                if self.active_position:
+                    log.warning(f"⚠️ Recovered ACTIVE POSITION: {self.active_position['security_id']}")
+        except Exception as e:
+            log.error(f"Error loading state: {e}")
 
 state = BotState()
 
@@ -162,6 +208,10 @@ def job_premarket():
         log.warning(f"🚫 Market is CLOSED today: {reason}. Bot will remain idle.")
         return
 
+    if not state.use_ai:
+        log.info("[09:00] 🤖 AI analysis disabled. Skipping Pre-market scan.")
+        return
+
     try:
         historical = fetch_historical_ohlcv()
         df_1h      = historical.get('1h')
@@ -181,6 +231,10 @@ def job_premarket():
 
 def job_market_open():
     log.info("\n[09:30] 📈 Market open scan...")
+    if not state.use_ai:
+        log.info("[09:30] 🤖 AI analysis disabled. Skipping Market-open scan.")
+        return
+
     try:
         open_data      = fetch_first_30min_candle()
         final_analysis = analyze_market_open(state.premarket_analysis, open_data)
@@ -209,13 +263,22 @@ def job_eod():
 def _on_position_closed(pnl: float = 0.0):
     """Called by the monitor thread when a position is fully closed."""
     with state.active_position_lock:
-        state.active_position = None
-        
-        # Track consecutive losses
+        # Check if it was a loss
         if pnl < 0:
             state.consecutive_losses += 1
+            # Record loss for directional cooldown
+            pos = state.active_position
+            if pos:
+                state.last_loss_time = datetime.now(IST)
+                state.last_loss_dir  = "CALL" if "CE" in pos.get('security_id', '') else "PUT"
         else:
             state.consecutive_losses = 0
+            # Reset loss tracking on profit
+            if hasattr(state, 'last_loss_time'): del state.last_loss_time
+            if hasattr(state, 'last_loss_dir'):  del state.last_loss_dir
+
+        state.active_position = None
+        state.save_state()  # Persist immediately on trade close
             
     log.info(f"📭 Position cleared — bot ready for next signal. (Consecutive Losses: {state.consecutive_losses})")
 
@@ -310,10 +373,13 @@ def execute_scalp_trade(rating_score: float, direction: str,
     if not order:
         return
 
+    # Monitor thread takes over
     with state.active_position_lock:
         state.active_position = order
-    state.daily_trades += 1
+        state.daily_trades += 1
+        state.save_state()  # Persist immediately on trade start
 
+    # Run the risk monitor in a separate thread
     threading.Thread(
         target=monitor_position,
         args=(order, state.live_mode, _on_position_closed),
@@ -381,10 +447,22 @@ def scalp_poll():
     if not hasattr(state, 'score_history'):
         state.score_history = []
     
+    # ── DIRECTIONAL TIMEOUT (Anti-Revenge) ──────────────────────────────
+    # If a recent loss occurred, block re-entry in same direction for 30m
+    now_ist = datetime.now(IST)
+    is_blocked = False
+    if hasattr(state, 'last_loss_time') and hasattr(state, 'last_loss_dir'):
+        time_since_loss = (now_ist - state.last_loss_time).total_seconds() / 60
+        if time_since_loss < 30:
+            intended_dir = "CALL" if score >= 0.3 else ("PUT" if score <= -0.3 else "NONE")
+            if intended_dir == state.last_loss_dir and intended_dir != "NONE":
+                log.warning(f"🚫 Directional Cooldown: Blocked {intended_dir} entry ({time_since_loss:.0f}m since last loss).")
+                is_blocked = True
+    
     rating = compute_multi_rating(window_df, rsi_window, adx_val, macd_w,
                                    pcr=pcr_data, fnf_direction=fnf_dir, ivr_signal=ivr_sig,
                                    score_history=state.score_history, mtf_score=mtf_score)
-    score  = rating['score']
+    score  = 0.0 if is_blocked else rating['score']
     bd     = rating['breakdown']
     state.last_breakdown = bd   # stash for execute_scalp_trade OI log
 
@@ -424,38 +502,66 @@ def scalp_poll():
         log.debug(f"Afternoon relaxed threshold: {_strong_thresh} (0 trades today)")
 
     # ── LLM Bias Filter ──────────────────────────────────────────────────
-    # If Gemini pre-market analysis is STRONG BULLISH/BEARISH, we only trade in that direction.
-    premarket_bias = state.premarket_analysis.get('strategy_suggestion', 'WAIT')
-    
-    if score >= _strong_thresh and prev_score < _strong_thresh:
-        if premarket_bias == 'BEARISH':
-            log.warning(f"⚠️ STRONG BUY blocked by LLM BEARISH bias ({premarket_bias})")
-            return
-        log.info(f"🟢 STRONG BUY crossed +{RATING_STRONG_BUY} → Buy CE")
-        execute_scalp_trade(score, 'SCALP_LONG', df_enriched=df_5m, pcr=pcr_data)
-    elif score <= -_strong_thresh and prev_score > -_strong_thresh:
-        if premarket_bias == 'BULLISH':
-            log.warning(f"⚠️ STRONG SELL blocked by LLM BULLISH bias ({premarket_bias})")
-            return
-        log.info(f"🔴 STRONG SELL crossed {RATING_STRONG_SELL} → Buy PE")
-        execute_scalp_trade(score, 'SCALP_SHORT', df_enriched=df_5m, pcr=pcr_data)
+    # If Gemini pre-market analysis is enabled and has a bias, we follow it.
+    if state.use_ai:
+        premarket_bias = state.premarket_analysis.get('strategy_suggestion', 'WAIT')
+        
+        if score >= _strong_thresh and prev_score < _strong_thresh:
+            if premarket_bias == 'BEARISH':
+                log.warning(f"⚠️ STRONG BUY blocked by LLM BEARISH bias ({premarket_bias})")
+                return
+            log.info(f"🟢 STRONG BUY crossed +{RATING_STRONG_BUY} → Buy CE")
+            execute_scalp_trade(score, 'SCALP_LONG', df_enriched=df_5m, pcr=pcr_data)
+        elif score <= -_strong_thresh and prev_score > -_strong_thresh:
+            if premarket_bias == 'BULLISH':
+                log.warning(f"⚠️ STRONG SELL blocked by LLM BULLISH bias ({premarket_bias})")
+                return
+            log.info(f"🔴 STRONG SELL crossed {RATING_STRONG_SELL} → Buy PE")
+            execute_scalp_trade(score, 'SCALP_SHORT', df_enriched=df_5m, pcr=pcr_data)
+    else:
+        # Standard execution without AI bias
+        if score >= _strong_thresh and prev_score < _strong_thresh:
+            log.info(f"🟢 STRONG BUY crossed +{RATING_STRONG_BUY} → Buy CE")
+            execute_scalp_trade(score, 'SCALP_LONG', df_enriched=df_5m, pcr=pcr_data)
+        elif score <= -_strong_thresh and prev_score > -_strong_thresh:
+            log.info(f"🔴 STRONG SELL crossed {RATING_STRONG_SELL} → Buy PE")
+            execute_scalp_trade(score, 'SCALP_SHORT', df_enriched=df_5m, pcr=pcr_data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
-def start_scheduler(live_mode: bool = False):
+def start_scheduler(live_mode: bool = False, use_ai: bool = False):
     state.live_mode = live_mode
+    state.use_ai = use_ai
     mode_str = '🔴 LIVE' if live_mode else '🟢 PAPER'
+    ai_str = 'Enabled' if use_ai else 'Disabled'
 
     balance = get_balance(live_mode)
     log.info(f"\n{'='*52}")
     log.info(f"  {mode_str} MODE — Nifty 50 Scalping Bot")
     log.info(f"  Balance      : ₹{balance:.2f}")
+    log.info(f"  AI Features  : {ai_str}")
     log.info(f"  Pre-market   : {TIME_PRE_MARKET}  |  Open: {TIME_MARKET_OPEN}  |  EOD: {TIME_EOD_CHECK}")
     log.info(f"  Scalp poll   : every 3 min | 09:35 → 14:45 (skip 12:00–13:15)")
     log.info(f"  Max trades   : 3/day  |  Max hold: 60 min")
     log.info(f"{'='*52}\n")
+
+    # ── Resume Monitoring if needed ─────────────────────────────────────
+    if state.active_position:
+        log.warning(f"🚀 Resuming monitor for recovered position: {state.active_position['order_id']}")
+        from .risk_manager import monitor_position
+        threading.Thread(
+            target=monitor_position,
+            args=(state.active_position['order_id'], 
+                  state.active_position['security_id'],
+                  state.active_position['entry_price'],
+                  state.active_position['sl_price'],
+                  state.active_position['tp_price'],
+                  live_mode,
+                  _on_position_closed),
+            daemon=True
+        ).start()
 
     schedule.every().day.at(TIME_PRE_MARKET).do(job_premarket)
     schedule.every().day.at(TIME_MARKET_OPEN).do(job_market_open)

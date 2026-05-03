@@ -41,6 +41,7 @@ def place_order(security_id: str, direction: str, qty: int,
     from .market_data import get_auth_headers
     from .config import INDSTOCKS_BASE, ALGO_ID
 
+    # Use standard /order endpoint as per documentation for reliability
     payload = {
         'txn_type':         txn_type,
         'exchange':         'NSE',
@@ -51,23 +52,16 @@ def place_order(security_id: str, direction: str, qty: int,
         'security_id':      security_id,
         'qty':              qty,
         'limit_price':      limit_price,
-        'sl_trigger_price': sl_price,
-        'tgt_trigger_price': tp_price,
-        'sl_limit_price':   max(0.05, round(sl_price  * 0.95, 2)),
-        'tgt_limit_price':  round(tp_price * 1.01, 2),
         'algo_id':          ALGO_ID,
+        'is_amo':           False
     }
     try:
-        url = f"{INDSTOCKS_BASE}/smart/order"
+        url = f"{INDSTOCKS_BASE}/order"
         res = requests.post(url, json=payload, headers=get_auth_headers(), timeout=5)
         if res.status_code == 200:
-            resp_data = res.json().get('data', {}).get('order_data', [])
-            if resp_data:
-                order['order_id'] = (
-                    resp_data[0].get('child_order_details', {})
-                                .get('order_id', resp_data[0].get('order_id', order_id))
-                )
-            log.info(f"✅ [LIVE TRADE] Smart Order {order['order_id']} placed!")
+            resp_data = res.json().get('data', {})
+            order['order_id'] = resp_data.get('order_id', order_id)
+            log.info(f"✅ [LIVE TRADE] Order {order['order_id']} placed successfully!")
             return order
         else:
             log.error(f"❌ [LIVE TRADE] Order Failed: {res.status_code} {res.text[:120]}")
@@ -83,10 +77,14 @@ def get_balance(live: bool = False) -> float:
         from .market_data import get_auth_headers
         from .config import INDSTOCKS_BASE
         try:
-            url = f"{INDSTOCKS_BASE}/user/margins"
+            # Using /funds endpoint as per official documentation
+            url = f"{INDSTOCKS_BASE}/funds"
             res = requests.get(url, headers=get_auth_headers(), timeout=5)
             if res.status_code == 200:
-                return float(res.json().get('data', {}).get('available_margin', 0.0))
+                data = res.json().get('data', {})
+                # 'option_buy' is the relevant balance for buying CE/PE options
+                detailed = data.get('detailed_avl_balance', {})
+                return float(detailed.get('option_buy', data.get('sod_balance', 0.0)))
             log.error(f"❌ Balance API {res.status_code}: {res.text[:80]}")
         except Exception as e:
             log.error(f"❌ Balance fetch error: {e}")
@@ -135,12 +133,13 @@ def close_order(order_id: str, exit_reason: str, pnl: float = 0.0, live: bool = 
     from .config import INDSTOCKS_BASE
 
     try:
-        url = f"{INDSTOCKS_BASE}/smart/order/cancel"
+        # Using standard /order/cancel endpoint as per official documentation
+        url = f"{INDSTOCKS_BASE}/order/cancel"
         res = requests.post(url,
                             json={'order_id': order_id, 'segment': 'DERIVATIVE'},
                             headers=get_auth_headers(), timeout=5)
         if res.status_code == 200:
-            log.info(f"✅ [LIVE TRADE] Position {order_id} cancelled successfully.")
+            log.info(f"✅ [LIVE TRADE] Order {order_id} cancellation request sent.")
             return True
         log.error(f"❌ [LIVE TRADE] Cancel failed: {res.status_code} {res.text[:120]}")
     except Exception as e:
