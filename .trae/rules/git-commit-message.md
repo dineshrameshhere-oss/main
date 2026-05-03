@@ -4,4 +4,4 @@ scene: git_message
 ---
 
 Write your rules here to customize the style of AI-generated commit messages.
-Short only one line.
+Commit message should not exceed 5 words.

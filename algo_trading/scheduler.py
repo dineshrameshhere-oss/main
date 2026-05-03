@@ -1,6 +1,8 @@
 import schedule
 import time
 import threading
+import os
+import json
 from datetime import datetime, timezone, timedelta
 
 from .logger import log
@@ -30,6 +32,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # ─────────────────────────────────────────────────────────────────────────────
 #  BOT STATE  (single shared instance — no class-level mutable defaults)
 # ─────────────────────────────────────────────────────────────────────────────
+_BASE_DIR  = os.path.dirname(__file__)
 STATE_FILE = os.path.join(_BASE_DIR, 'bot_state.json')
 
 class BotState:
