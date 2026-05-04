@@ -45,13 +45,14 @@ def place_order(security_id: str, direction: str, qty: int,
     raw_security_id = security_id.replace('NFO_', '')
 
     # ── QTY SAFETY CHECK ──────────────────────────────────────────────────
-    # NSE requires Nifty quantities to be multiples of 65.
+    # NSE requires Nifty quantities to be multiples of the current lot size.
+    from .config import LOT_SIZE as _lot
     if 'NIFTY' in security_id.upper() or int(raw_security_id) > 0:
-        if qty % 65 != 0:
+        if qty % _lot != 0:
             old_qty = qty
-            qty = (qty // 65) * 65
-            if qty == 0: qty = 65
-            log.warning(f"⚠️ Qty Adjustment: {old_qty} → {qty} (must be multiple of 65 for Nifty)")
+            qty = (qty // _lot) * _lot
+            if qty == 0: qty = _lot
+            log.warning(f"⚠️ Qty Adjustment: {old_qty} → {qty} (must be multiple of {_lot} for Nifty)")
             order['qty'] = qty   # keep order dict in sync so monitor closes correct qty
 
     # Use standard /order endpoint as per documentation for reliability

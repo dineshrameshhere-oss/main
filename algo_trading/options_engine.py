@@ -1,6 +1,6 @@
 from .logger import log
 from . import config
-from .config import INDSTOCKS_BASE, PCR_BULLISH_MAX, PCR_BEARISH_MIN
+from .config import INDSTOCKS_BASE, PCR_BULLISH_MAX, PCR_BEARISH_MIN, MIN_DELTA_ENTRY, MIN_PREMIUM_ENTRY
 from .market_data import fetch_ltp, get_auth_headers
 import requests
 import pandas as pd
@@ -53,12 +53,16 @@ def _get_instruments() -> pd.DataFrame:
                 
                 # If we found a lot column, use it
                 if lot_col:
-                    config.LOT_SIZE = int(active_row[lot_col])
-                    log.info(f"📊 DYNAMIC LOT SIZE DETECTED: {config.LOT_SIZE} (from {lot_col})")
+                    raw_lot = int(active_row[lot_col])
+                    # Sanity check: Nifty lot size must be 50-100 (NSE standard range).
+                    # CSV sometimes returns FREEZE_QTY (1300+) or wrong column.
+                    if 50 <= raw_lot <= 100:
+                        config.LOT_SIZE = raw_lot
+                        log.info(f"📊 DYNAMIC LOT SIZE DETECTED: {config.LOT_SIZE} (from {lot_col})")
+                    else:
+                        log.warning(f"⚠️ Lot size from CSV ({raw_lot}) out of range [50-100] — using default {config.LOT_SIZE}")
                 else:
-                    # Fallback: Hardcoded 65 as it is the current exchange standard for Nifty
-                    config.LOT_SIZE = 65
-                    log.warning("⚠️ Dynamic Lot Size: Column not found, using Nifty standard 65.")
+                    log.warning("⚠️ Dynamic Lot Size: Column not found, using default.")
             else:
                 log.warning("⚠️ Dynamic Lot Size: Could not find NIFTY OPTIDX in instruments.")
                 config.LOT_SIZE = 65 # Safe fallback for Nifty
@@ -343,6 +347,25 @@ def select_strike(direction: str, spot_price: float, budget: float) -> dict:
         best_choice = max(candidates, key=lambda x: x['delta'])
 
     if best_choice:
+        # ── Hard quality gates ─────────────────────────────────────────────
+        if best_choice['delta'] < MIN_DELTA_ENTRY:
+            log.warning(
+                f"🚫 Best affordable strike {best_choice['strike']} {opt_type} "
+                f"has delta {best_choice['delta']:.2f} < {MIN_DELTA_ENTRY} minimum. "
+                f"Skipping trade — budget too tight for quality strike."
+            )
+            return {"security_id": f"NFO_DUMMY_{int(atm)}_{opt_type}", "strike": atm,
+                    "type": opt_type, "days_to_expiry": 7, "simulated_premium": 0.0}
+
+        if best_choice['premium'] < MIN_PREMIUM_ENTRY:
+            log.warning(
+                f"🚫 Best strike {best_choice['strike']} {opt_type} "
+                f"premium ₹{best_choice['premium']:.2f} < ₹{MIN_PREMIUM_ENTRY} minimum. "
+                f"Bid-ask spread would eat SL — skipping."
+            )
+            return {"security_id": f"NFO_DUMMY_{int(atm)}_{opt_type}", "strike": atm,
+                    "type": opt_type, "days_to_expiry": 7, "simulated_premium": 0.0}
+
         log.info(f"✅ Quality Match: NIFTY {best_choice['strike']} {opt_type} @ Rs {best_choice['premium']:.2f} (Delta {best_choice['delta']:.2f})")
         return {
             "security_id":       best_choice['sec_id'],
@@ -352,7 +375,7 @@ def select_strike(direction: str, spot_price: float, budget: float) -> dict:
             "simulated_premium": best_choice['premium']
         }
     else:
-        log.warning("⚠️ No affordable quality strikes found.")
+        log.warning("⚠️ No affordable strikes found.")
         return {
             "security_id":       f"NFO_DUMMY_{int(atm)}_{opt_type}",
             "strike":            atm,
@@ -367,17 +390,25 @@ def select_strike(direction: str, spot_price: float, budget: float) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 def calculate_dynamic_risk(premium: float):
     """
-    SL/TP calibrated to OTM momentum scalping.
-    TP at 25% — achievable given that on strong momentum days,
-    OTM premiums can 2-3x easily (100→250 is 150% gain).
-    The trailing SL ladder in config.py takes over once price moves in our favour.
+    SL/TP calibrated to the actual option premium level.
+
+    The TP is an initial notification trigger only — the trailing SL ladder
+    in config.py handles the actual exit and lets winners run to 100-200%+.
+    The SL here is the REAL hard floor used by risk_manager (not DEFAULT_SL_PCT).
+
+    Wider SL for cheaper options because:
+    - Bid-ask spread on ₹50 option can be ₹1-3 (2-6% alone)
+    - A 1% Nifty noise move hits ₹50 option hard % wise but barely in ₹
+    - We need room to survive the first 5-10 minutes of trade
     """
-    if premium < 80:
-        return 0.10, 0.25   # Deep OTM — SL 10%, TP 25% (needs big move)
-    elif premium < 180:
-        return 0.08, 0.25   # ATM-ish — SL 8%, TP 25%
+    if premium < 60:
+        return 0.20, 0.80   # Shallow OTM: 20% SL, 80% TP trigger (bid-ask wide)
+    elif premium < 120:
+        return 0.15, 0.60   # Near OTM: 15% SL, 60% TP trigger
+    elif premium < 200:
+        return 0.10, 0.40   # ATM-ish: 10% SL, 40% TP trigger
     else:
-        return 0.05, 0.25   # ITM — tight SL, same TP
+        return 0.07, 0.30   # ITM: tight SL, 30% TP trigger
 
 
 def calculate_qty(budget: float, option_premium: float, is_strong_conviction: bool = False, lot_size: int = None):
