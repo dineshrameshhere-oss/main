@@ -21,10 +21,31 @@ def _get_instruments() -> pd.DataFrame:
         res = requests.get(url, headers=get_auth_headers(), timeout=10)
         if res.status_code == 200:
             _INSTRUMENTS_DF = pd.read_csv(io.StringIO(res.text))
+            
+            # ── DYNAMIC LOT SIZE EXTRACTION ─────────────────────────────────────
+            # Clean column names
+            _INSTRUMENTS_DF.columns = _INSTRUMENTS_DF.columns.str.strip().str.upper()
+            
             _INSTRUMENTS_DF['EXPIRY_DATE'] = pd.to_datetime(
                 _INSTRUMENTS_DF['EXPIRY_DATE'], errors='coerce'
             )
             log.info(f"Instruments loaded: {len(_INSTRUMENTS_DF)} rows")
+            
+            # Check for LOT_SIZE column (often named 'MIN_LOT_QUANTITY' or 'LOT_SIZE')
+            lot_col = next((c for c in ['MIN_LOT_QUANTITY', 'LOT_SIZE', 'FREEZE_QTY'] if c in _INSTRUMENTS_DF.columns), None)
+            if lot_col:
+                # Get Nifty lot size from the first Nifty OPTIDX row
+                nifty_sample = _INSTRUMENTS_DF[
+                    _INSTRUMENTS_DF['TRADING_SYMBOL'].str.upper().str.startswith('NIFTY', na=False) &
+                    (_INSTRUMENTS_DF['INSTRUMENT_NAME'] == 'OPTIDX')
+                ]
+                if not nifty_sample.empty:
+                    dynamic_lot = int(nifty_sample.iloc[0][lot_col])
+                    if dynamic_lot > 0:
+                        from . import config
+                        config.LOT_SIZE = dynamic_lot
+                        log.info(f"📊 DYNAMIC LOT SIZE DETECTED: {config.LOT_SIZE} (from {lot_col})")
+
             return _INSTRUMENTS_DF
     except Exception as e:
         log.error(f"Error fetching instruments: {e}")

@@ -28,23 +28,23 @@ INTRADAY_TSL_ACTIVATION    = 15.0        # Activate TSL at 15% profit
 INTRADAY_TSL_TRAIL         = 8.0         # Trail by 8%
 
 # Trading Constants
-LOT_SIZE          = 75                   # Nifty options lot size (updated to 75 as per NSE 2026)
+LOT_SIZE          = 75                   # Fallback Nifty lot size (dynamically updated by options_engine)
 
 # ── Position Scaling Tiers (Quality Premium Focus) ───────────────────────────
-# Each lot = 75 units. We prioritize QUALITY (ATM/Shallow OTM) over quantity.
+# Each lot = 65 units. We prioritize QUALITY (ATM/Shallow OTM) over quantity.
 # High Delta (0.45+) premiums cost more (₹100–₹250), so we scale slower.
 #
 # Capital Tier     | Max Lots | Approx. Cost per Trade
 # -----------------|----------|----------------------------------
-# ₹5,000           | 1 lot    | ₹2,500 - ₹5,000 (Cheap OTM needed if premium > 66)
-# ₹15,000          | 2 lots   | ₹7,500 - ₹15,000
-# ₹30,000          | 3 lots   | ₹12,500 - ₹22,000
-# ₹60,000          | 4 lots   | ₹18,000 - ₹30,000
-# ₹1,20,000        | 5 lots   | ₹25,000 - ₹45,000
+# ₹5,000           | 1 lot    | ₹2,500 - ₹5,000 (Premium limit ₹76)
+# ₹15,000          | 2 lots   | ₹6,500 - ₹13,000
+# ₹30,000          | 3 lots   | ₹9,750 - ₹19,500
+# ₹60,000          | 4 lots   | ₹13,000 - ₹26,000
+# ₹1,20,000        | 5 lots   | ₹19,500 - ₹39,000
 #
 # NOTE: Only scale up on STRONG_BUY signals (score >= 0.85).
 LOT_SCALE_TIERS = [
-    (5_000,   1),   # ₹5K  → 1 lot (75 units)
+    (5_000,   1),   # ₹5K  → 1 lot (65 units)
     (15_000,  2),   # ₹15K → 2 lots
     (30_000,  3),   # ₹30K → 3 lots
     (60_000,  4),   # ₹60K → 4 lots
