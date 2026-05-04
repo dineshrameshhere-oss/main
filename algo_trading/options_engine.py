@@ -1,5 +1,6 @@
 from .logger import log
-from .config import LOT_SIZE, INDSTOCKS_BASE, PCR_BULLISH_MAX, PCR_BEARISH_MIN
+from . import config
+from .config import INDSTOCKS_BASE, PCR_BULLISH_MAX, PCR_BEARISH_MIN
 from .market_data import fetch_ltp, get_auth_headers
 import requests
 import pandas as pd
@@ -31,20 +32,30 @@ def _get_instruments() -> pd.DataFrame:
             )
             log.info(f"Instruments loaded: {len(_INSTRUMENTS_DF)} rows")
             
-            # Check for LOT_SIZE column (often named 'MIN_LOT_QUANTITY' or 'LOT_SIZE')
-            lot_col = next((c for c in ['MIN_LOT_QUANTITY', 'LOT_SIZE', 'FREEZE_QTY'] if c in _INSTRUMENTS_DF.columns), None)
+            # Debug: Log column names to find the right lot size column
+            log.debug(f"Instrument columns: {list(_INSTRUMENTS_DF.columns)}")
+
+            # Check for LOT_SIZE column
+            # INDMoney typically uses 'LOT_SIZE' or 'MIN_LOT_QUANTITY'
+            lot_col = next((c for c in ['LOT_SIZE', 'MIN_LOT_QUANTITY', 'FREEZE_QTY'] if c in _INSTRUMENTS_DF.columns), None)
+            
             if lot_col:
-                # Get Nifty lot size from the first Nifty OPTIDX row
-                nifty_sample = _INSTRUMENTS_DF[
+                # Filter for NIFTY OPTIDX
+                nifty_mask = (
                     _INSTRUMENTS_DF['TRADING_SYMBOL'].str.upper().str.startswith('NIFTY', na=False) &
                     (_INSTRUMENTS_DF['INSTRUMENT_NAME'] == 'OPTIDX')
-                ]
+                )
+                nifty_sample = _INSTRUMENTS_DF[nifty_mask]
+                
                 if not nifty_sample.empty:
                     dynamic_lot = int(nifty_sample.iloc[0][lot_col])
                     if dynamic_lot > 0:
-                        from . import config
                         config.LOT_SIZE = dynamic_lot
                         log.info(f"📊 DYNAMIC LOT SIZE DETECTED: {config.LOT_SIZE} (from {lot_col})")
+                else:
+                    log.warning("⚠️ Dynamic Lot Size: Could not find NIFTY OPTIDX row in instruments.")
+            else:
+                log.warning(f"⚠️ Dynamic Lot Size: Could not find lot column in instruments. Columns: {list(_INSTRUMENTS_DF.columns)}")
 
             return _INSTRUMENTS_DF
     except Exception as e:
@@ -295,7 +306,7 @@ def select_strike(direction: str, spot_price: float, budget: float) -> dict:
                 # Calculate Delta to verify 'Quality'
                 greeks = compute_greeks(spot_price, strike, days_to_exp, ltp, opt_type)
                 delta = greeks['delta']
-                cost = ltp * LOT_SIZE
+                cost = ltp * config.LOT_SIZE
 
                 log.info(f"  {strike} {opt_type}: Rs {ltp:.2f} | Delta {delta:.2f} | Cost Rs {cost:.0f}")
 
@@ -363,7 +374,7 @@ def calculate_dynamic_risk(premium: float):
         return 0.05, 0.25   # ITM — tight SL, same TP
 
 
-def calculate_qty(budget: float, option_premium: float, is_strong_conviction: bool = False, lot_size: int = LOT_SIZE):
+def calculate_qty(budget: float, option_premium: float, is_strong_conviction: bool = False, lot_size: int = None):
     """
     Calculates how many lots to buy based on budget and LOT_SCALE_TIERS.
     Only returns multiple lots if is_strong_conviction is True.
@@ -372,6 +383,9 @@ def calculate_qty(budget: float, option_premium: float, is_strong_conviction: bo
     if option_premium <= 0:
         return 0, 0, 0
     
+    if lot_size is None:
+        lot_size = config.LOT_SIZE
+
     from .config import LOT_SCALE_TIERS
     cost_per_lot = option_premium * lot_size
     
