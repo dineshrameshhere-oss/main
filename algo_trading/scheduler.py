@@ -136,9 +136,9 @@ def _get_enriched_df():
     
     # If timestamp doesn't have tz, assume it's UTC from API and convert to IST
     if latest_ts.tzinfo is None:
-        latest_ts = pd.to_datetime(latest_ts, utc=True).tz_convert(IST).tz_localize(None)
+        latest_ts = pd.to_datetime(latest_ts, utc=True).tz_convert(IST)
     else:
-        latest_ts = latest_ts.astimezone(IST).replace(tzinfo=None)
+        latest_ts = latest_ts.astimezone(IST)
 
     # If the latest data is more than 15 minutes old during market hours, it's stale.
     # If the latest data is from yesterday, it's a holiday/weekend.
