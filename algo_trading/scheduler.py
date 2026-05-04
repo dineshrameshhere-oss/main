@@ -295,7 +295,8 @@ def _on_position_closed(pnl: float = 0.0):
 #  TRADE EXECUTION
 # ─────────────────────────────────────────────────────────────────────────────
 def execute_scalp_trade(rating_score: float, direction: str,
-                        df_enriched=None, pcr: dict | None = None):
+                        df_enriched=None, pcr: dict | None = None,
+                        ivr_data: dict | None = None):
     """Enters a trade after passing all quality filters."""
     if state.daily_trades >= 3:
         log.warning("🚫 Max 3 trades/day reached.")
@@ -323,22 +324,37 @@ def execute_scalp_trade(rating_score: float, direction: str,
         log.info(f"  📊 PCR={pcr.get('pcr',1.0):.2f} ({pcr.get('bias','N/A')}) | included in composite score")
 
 
-    # ── 4. Strike selection (Nifty first, Sensex fallback) ────────────────
+    # ── 4. Strike selection (Nifty first, BankNifty fallback) ────────────
+    from .config import OTM_VOL_MIN_SCORE, OTM_VOL_MAX_HOLD_MIN, OTM_STAGNATION_TICKS
+
     spot        = float(df['Close'].iloc[-1])
-    strike_info = select_strike(direction, spot, current_balance)
+    ivr         = ivr_data.get('ivr', 50.0) if ivr_data else 50.0
+    strike_info = select_strike(direction, spot, current_balance, ivr=ivr)
     premium     = strike_info.get('simulated_premium', 0.0)
 
     if premium <= 0:
-        # Nifty delta-gate fired (budget too tight for quality strike).
-        # Try BankNifty — lot size 15, ATM ~₹280-380 × 15 = ₹4,200-5,700.
-        # BankNifty is 2-3× more volatile than Nifty — same signal, more ₹ gain.
+        # Nifty delta-gate fired — try BankNifty (lot 15, ATM fits ₹5K budget).
         log.info("ℹ️ Nifty strike blocked — checking BankNifty NSE options as fallback...")
-        strike_info = select_banknifty_strike(direction, current_balance)
+        strike_info = select_banknifty_strike(direction, current_balance, ivr=ivr)
         premium     = strike_info.get('simulated_premium', 0.0)
         if premium <= 0:
             log.warning("⚠️ BankNifty also has no quality strike — skipping trade this cycle.")
             return
         log.info(f"🔀 Switching to BANKNIFTY options for this trade (direction: {direction})")
+
+    # ── Vol-mode gate: OTM entries require max-conviction score ───────────
+    vol_mode = strike_info.get('vol_mode', False)
+    if vol_mode and abs(rating_score) < OTM_VOL_MIN_SCORE:
+        log.warning(
+            f"🚫 OTM Vol Mode blocked: score {rating_score:+.2f} needs ±{OTM_VOL_MIN_SCORE}. "
+            f"Signals not strong enough to justify OTM risk — skipping."
+        )
+        return
+    if vol_mode:
+        log.info(
+            f"⚡ OTM VOL MODE | Score {rating_score:+.2f} ≥ {OTM_VOL_MIN_SCORE} ✓ | "
+            f"Max hold: {OTM_VOL_MAX_HOLD_MIN}min | Stagnation exit after 15min"
+        )
 
     # Correct scaled spot for Greeks calculation.
     # select_strike/select_banknifty_strike already used real spot internally.
@@ -396,6 +412,11 @@ def execute_scalp_trade(rating_score: float, direction: str,
     )
     if not order:
         return
+
+    # Tag OTM vol mode onto the order so the monitor thread enforces speed rules
+    if vol_mode:
+        order['otm_vol_mode'] = True
+        order['max_hold_min'] = OTM_VOL_MAX_HOLD_MIN
 
     # Monitor thread takes over
     with state.active_position_lock:
@@ -543,27 +564,27 @@ def scalp_poll():
     # If Gemini pre-market analysis is enabled and has a bias, we follow it.
     if state.use_ai:
         premarket_bias = state.premarket_analysis.get('strategy_suggestion', 'WAIT')
-        
+
         if score >= _strong_thresh and prev_score < _strong_thresh:
             if premarket_bias == 'BEARISH':
                 log.warning(f"⚠️ STRONG BUY blocked by LLM BEARISH bias ({premarket_bias})")
                 return
             log.info(f"🟢 STRONG BUY crossed +{RATING_STRONG_BUY} → Buy CE")
-            execute_scalp_trade(score, 'SCALP_LONG', df_enriched=df_5m, pcr=pcr_data)
+            execute_scalp_trade(score, 'SCALP_LONG', df_enriched=df_5m, pcr=pcr_data, ivr_data=ivr_data)
         elif score <= -_strong_thresh and prev_score > -_strong_thresh:
             if premarket_bias == 'BULLISH':
                 log.warning(f"⚠️ STRONG SELL blocked by LLM BULLISH bias ({premarket_bias})")
                 return
             log.info(f"🔴 STRONG SELL crossed {RATING_STRONG_SELL} → Buy PE")
-            execute_scalp_trade(score, 'SCALP_SHORT', df_enriched=df_5m, pcr=pcr_data)
+            execute_scalp_trade(score, 'SCALP_SHORT', df_enriched=df_5m, pcr=pcr_data, ivr_data=ivr_data)
     else:
         # Standard execution without AI bias
         if score >= _strong_thresh and prev_score < _strong_thresh:
             log.info(f"🟢 STRONG BUY crossed +{RATING_STRONG_BUY} → Buy CE")
-            execute_scalp_trade(score, 'SCALP_LONG', df_enriched=df_5m, pcr=pcr_data)
+            execute_scalp_trade(score, 'SCALP_LONG', df_enriched=df_5m, pcr=pcr_data, ivr_data=ivr_data)
         elif score <= -_strong_thresh and prev_score > -_strong_thresh:
             log.info(f"🔴 STRONG SELL crossed {RATING_STRONG_SELL} → Buy PE")
-            execute_scalp_trade(score, 'SCALP_SHORT', df_enriched=df_5m, pcr=pcr_data)
+            execute_scalp_trade(score, 'SCALP_SHORT', df_enriched=df_5m, pcr=pcr_data, ivr_data=ivr_data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

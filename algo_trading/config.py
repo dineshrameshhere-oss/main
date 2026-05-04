@@ -78,6 +78,24 @@ LOT_SCALE_TIERS = [
 MIN_DELTA_ENTRY   = 0.25   # Minimum delta: below this, option barely moves per Nifty point
 MIN_PREMIUM_ENTRY = 40.0   # Minimum premium ₹: below this, bid-ask spread eats SL instantly
 
+# ── Volatility-Justified OTM Mode ────────────────────────────────────────────
+# Allow delta < 0.25 (OTM) ONLY when ALL three conditions hold simultaneously:
+#   1. IVR < OTM_VOL_IVR_MAX  → options are CHEAP. Buying before IV expansion, not after.
+#      (If IVR is already high, the move is priced in. Any rally = IV crush = loss.)
+#   2. Score >= OTM_VOL_MIN_SCORE → every signal (RSI/ADX/PCR/MTF/MACD) must agree.
+#      OTM needs a large, fast move. Marginal signals don't produce those.
+#   3. OTM distance <= IV-implied daily move × OTM_VOL_IV_MOVE_MULT
+#      → statistical validation the strike has a real chance of going ITM today.
+# Profit mechanism: cheap OTM + strong move + IV expansion = 50-200%+ gain.
+# Risk: theta bleeds OTM fast. Hard 30-min hold cap and stagnation exit enforce speed.
+OTM_VOL_IVR_MAX      = 45     # IVR ceiling — above this, IV crush risk outweighs upside
+OTM_VOL_MIN_DELTA    = 0.15   # Hard floor even in vol mode (below this = lottery ticket)
+OTM_VOL_MIN_SCORE    = 0.85   # Max-conviction only — all signals must agree
+OTM_VOL_MAX_HOLD_MIN = 30     # 30-min max hold — theta acceleration kills OTM past this
+OTM_VOL_IV_MOVE_MULT = 1.5    # OTM distance must be ≤ IV-implied daily move × this
+OTM_STAGNATION_TICKS = 90     # 15 min at 10s/tick — start stagnation watch after this
+OTM_STAGNATION_PCT   = -0.08  # Exit if PnL < -8% with no improving trend (theta trap)
+
 # LLM Config
 GEMINI_MODEL      = "gemini-2.0-flash"
 

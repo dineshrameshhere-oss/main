@@ -2,7 +2,8 @@ import time
 from typing import Callable
 from .logger import log
 from .trade_executor import close_order
-from .config import DEFAULT_SL_PCT, MAX_DAILY_LOSS_PCT, TRAILING_STEPS, BROKERAGE_PER_TRADE, MIN_PREMIUM_ENTRY
+from .config import (DEFAULT_SL_PCT, MAX_DAILY_LOSS_PCT, TRAILING_STEPS, BROKERAGE_PER_TRADE,
+                     MIN_PREMIUM_ENTRY, OTM_STAGNATION_TICKS, OTM_STAGNATION_PCT)
 
 # Max retries when LTP fetch returns zero (API hiccup)
 _LTP_ZERO_MAX_RETRIES = 5
@@ -76,8 +77,12 @@ def monitor_position(order: dict, live: bool = False,
         if on_close: on_close(0.0)
         return
 
+    # Vol-mode flags — OTM entries have faster exit rules to fight theta decay
+    otm_vol_mode  = order.get('otm_vol_mode', False)
+    max_hold_min  = int(order.get('max_hold_min', 60))
+
     # Tracking state
-    peak_pnl_pct     = 0.0
+    peak_pnl_pct  = 0.0
     # Use the order's computed sl_price as the initial hard floor.
     # This respects wider SLs for cheaper options (e.g. -15% for ₹60 premium)
     # so we don't get stopped by bid-ask spread noise.
@@ -88,14 +93,16 @@ def monitor_position(order: dict, live: bool = False,
         current_sl_floor = -DEFAULT_SL_PCT
     zero_ltp_retries = 0
     tick             = 0
-    max_ticks        = 360               # 360 × 10s = 60 min max hold
+    max_ticks        = max_hold_min * 6  # 6 ticks/min at 10s each
     tp_logged        = False
 
     log.info(
         f"Monitor START [{order_id}] | Entry ₹{entry:.2f} | "
         f"Hard SL ₹{hard_sl:.2f} ({current_sl_floor*100:.0f}%) | "
         f"Initial TP ₹{initial_tp:.2f} | "
-        f"Mode: {'LIVE' if live else 'PAPER'} | Poll: 10s | Max hold: 60 min"
+        f"Mode: {'LIVE' if live else 'PAPER'} | Poll: 10s | "
+        f"Max hold: {max_hold_min} min"
+        + (" | ⚡ OTM VOL MODE — stagnation exit ON" if otm_vol_mode else "")
     )
     log.info(f"Stepped Trailing SL active — {len(TRAILING_STEPS)} rungs up to +200%")
 
@@ -184,18 +191,37 @@ def monitor_position(order: dict, live: bool = False,
                 f"🚨 DAILY LOSS LIMIT [{order_id}] | Loss ₹{abs(pnl_amount):.0f} "
                 f"exceeds {MAX_DAILY_LOSS_PCT*100:.0f}% circuit breaker."
             )
-            close_order(order_id, "DAILY_LOSS_LIMIT", pnl=pnl_amount, live=live, 
+            close_order(order_id, "DAILY_LOSS_LIMIT", pnl=pnl_amount, live=live,
                         security_id=security_id, qty=qty)
             if on_close: on_close(pnl_amount)
             return
 
-    # ── 4. 60-MINUTE MAX HOLD REACHED ─────────────────────────────────────────
+        # ── 4. OTM STAGNATION EXIT ────────────────────────────────────────────
+        # OTM options bleed from theta when the underlying does not move.
+        # After 15 minutes: if we're underwater AND the position is declining
+        # (not just a temporary dip) → cut the loss before theta eats more.
+        # Condition: pnl < -8% AND current pnl is 3% below peak (declining, not stable).
+        if (otm_vol_mode
+                and tick >= OTM_STAGNATION_TICKS
+                and pnl_pct < OTM_STAGNATION_PCT
+                and pnl_pct <= peak_pnl_pct - 0.03):
+            log.warning(
+                f"⏱️ OTM STAGNATION [{order_id}] | {tick * 10 // 60}min elapsed | "
+                f"PnL {pnl_pct*100:+.1f}% | Peak {peak_pnl_pct*100:+.1f}% | "
+                f"Theta bleeding with no recovery trend — cutting loss now."
+            )
+            close_order(order_id, "OTM_STAGNATION", pnl=pnl_amount, live=live,
+                        security_id=security_id, qty=qty)
+            if on_close: on_close(pnl_amount)
+            return
+
+    # ── 5. MAX HOLD REACHED ────────────────────────────────────────────────────
     final_premium = _fetch_live_premium(security_id)
     if final_premium <= 0:
         final_premium = entry   # last-resort fallback
     final_pnl = (final_premium - entry) * qty
     log.info(
-        f"⏰ TIME LIMIT [{order_id}] | 60 min elapsed | "
+        f"⏰ TIME LIMIT [{order_id}] | {max_hold_min} min elapsed | "
         f"Exit ₹{final_premium:.2f} | PnL ₹{final_pnl:+.0f}"
     )
     close_order(order_id, "TIME_LIMIT_EXIT", pnl=final_pnl, live=live, 

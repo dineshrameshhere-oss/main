@@ -2,7 +2,8 @@ from .logger import log
 from . import config
 from .config import (INDSTOCKS_BASE, PCR_BULLISH_MAX, PCR_BEARISH_MIN,
                      MIN_DELTA_ENTRY, MIN_DELTA_ENTRY_EXPIRY, MIN_PREMIUM_ENTRY,
-                     BANKNIFTY_LOT_SIZE)
+                     BANKNIFTY_LOT_SIZE,
+                     OTM_VOL_IVR_MAX, OTM_VOL_MIN_DELTA, OTM_VOL_IV_MOVE_MULT)
 from .market_data import fetch_ltp, get_auth_headers
 import requests
 import pandas as pd
@@ -261,7 +262,7 @@ def get_security_id_for_option(strike: float, opt_type: str, expiry: pd.Timestam
 # ─────────────────────────────────────────────────────────────────────────────
 #  SELECT BEST STRIKE  (core function called by scheduler)
 # ─────────────────────────────────────────────────────────────────────────────
-def select_strike(direction: str, spot_price: float, budget: float) -> dict:
+def select_strike(direction: str, spot_price: float, budget: float, ivr: float = 50.0) -> dict:
     """
     Finds a 'Quality Premium' NIFTY option strike (Delta 0.35 - 0.55).
     
@@ -328,7 +329,8 @@ def select_strike(direction: str, spot_price: float, budget: float) -> dict:
                         'premium': ltp,
                         'sec_id': sec_id,
                         'delta': delta,
-                        'days_to_exp': days_to_exp
+                        'days_to_exp': days_to_exp,
+                        'greeks': greeks,
                     })
 
     # Selection Logic:
@@ -358,14 +360,38 @@ def select_strike(direction: str, spot_price: float, budget: float) -> dict:
         if on_expiry and is_near_atm:
             log.info(f"⚡ Expiry-day gamma mode active — min delta relaxed to {MIN_DELTA_ENTRY_EXPIRY}")
 
+        _empty = {"security_id": f"NFO_DUMMY_{int(atm)}_{opt_type}", "strike": atm,
+                  "type": opt_type, "days_to_expiry": 7, "simulated_premium": 0.0,
+                  "vol_mode": False}
+
+        vol_mode = False
         if best_choice['delta'] < min_delta_effective:
-            log.warning(
-                f"🚫 Best affordable strike {best_choice['strike']} {opt_type} "
-                f"has delta {best_choice['delta']:.2f} < {min_delta_effective} minimum. "
-                f"Skipping trade — budget too tight for quality strike."
-            )
-            return {"security_id": f"NFO_DUMMY_{int(atm)}_{opt_type}", "strike": atm,
-                    "type": opt_type, "days_to_expiry": 7, "simulated_premium": 0.0}
+            # ── Volatility-Justified OTM Exception ────────────────────────────
+            # Before blocking, check if low IVR + IV-implied daily move statistically
+            # justifies this OTM strike. Cheap vol + strong signal = explosive upside.
+            b = best_choice
+            iv_annual     = b['greeks'].get('iv_pct', 20.0) / 100.0
+            iv_daily_pts  = spot_price * (iv_annual / (252 ** 0.5))
+            otm_dist_pts  = abs(b['strike'] - spot_price)
+            iv_covers     = otm_dist_pts <= iv_daily_pts * OTM_VOL_IV_MOVE_MULT
+
+            if (b['delta'] >= OTM_VOL_MIN_DELTA and ivr < OTM_VOL_IVR_MAX and iv_covers):
+                vol_mode = True
+                log.info(
+                    f"📊 OTM Vol Mode [NIFTY]: IVR={ivr:.0f} < {OTM_VOL_IVR_MAX} ✓ | "
+                    f"IV daily {iv_daily_pts:.0f}pts ≥ OTM {otm_dist_pts:.0f}pts / {OTM_VOL_IV_MOVE_MULT} ✓ | "
+                    f"δ={b['delta']:.2f} ≥ {OTM_VOL_MIN_DELTA} ✓ | 30-min hold, stagnation exit active"
+                )
+            else:
+                reasons = []
+                if b['delta'] < OTM_VOL_MIN_DELTA:
+                    reasons.append(f"δ={b['delta']:.2f} < {OTM_VOL_MIN_DELTA} hard floor")
+                if ivr >= OTM_VOL_IVR_MAX:
+                    reasons.append(f"IVR={ivr:.0f} ≥ {OTM_VOL_IVR_MAX} (IV crush risk)")
+                if not iv_covers:
+                    reasons.append(f"OTM dist {otm_dist_pts:.0f}pts > IV move {iv_daily_pts:.0f}pts×{OTM_VOL_IV_MOVE_MULT}")
+                log.warning(f"🚫 NIFTY {b['strike']} {opt_type} blocked: {' | '.join(reasons)}")
+                return _empty
 
         if best_choice['premium'] < MIN_PREMIUM_ENTRY:
             log.warning(
@@ -373,16 +399,20 @@ def select_strike(direction: str, spot_price: float, budget: float) -> dict:
                 f"premium ₹{best_choice['premium']:.2f} < ₹{MIN_PREMIUM_ENTRY} minimum. "
                 f"Bid-ask spread would eat SL — skipping."
             )
-            return {"security_id": f"NFO_DUMMY_{int(atm)}_{opt_type}", "strike": atm,
-                    "type": opt_type, "days_to_expiry": 7, "simulated_premium": 0.0}
+            return _empty
 
-        log.info(f"✅ Quality Match: NIFTY {best_choice['strike']} {opt_type} @ Rs {best_choice['premium']:.2f} (Delta {best_choice['delta']:.2f})")
+        tag = " [OTM VOL MODE]" if vol_mode else ""
+        log.info(
+            f"✅ NIFTY {best_choice['strike']} {opt_type} "
+            f"@ ₹{best_choice['premium']:.2f} (δ={best_choice['delta']:.2f}){tag}"
+        )
         return {
             "security_id":       best_choice['sec_id'],
             "strike":            best_choice['strike'],
             "type":              opt_type,
             "days_to_expiry":    best_choice['days_to_exp'],
-            "simulated_premium": best_choice['premium']
+            "simulated_premium": best_choice['premium'],
+            "vol_mode":          vol_mode,
         }
     else:
         log.warning("⚠️ No affordable strikes found.")
@@ -524,7 +554,7 @@ def fetch_banknifty_spot() -> float:
 #  2-3× more volatile than Nifty (400-600pt daily swings) — same signal, more ₹ gain.
 #  On expiry day (Wednesday), gamma is 3-5× higher: allows delta as low as 0.12.
 # ─────────────────────────────────────────────────────────────────────────────
-def select_banknifty_strike(direction: str, budget: float) -> dict:
+def select_banknifty_strike(direction: str, budget: float, ivr: float = 50.0) -> dict:
     """
     Finds a quality BankNifty NSE option strike.
     Uses same instruments cache as Nifty (both are NSE FNO, NFO_ prefix).
@@ -592,7 +622,7 @@ def select_banknifty_strike(direction: str, budget: float) -> dict:
             candidates.append({
                 'strike': strike, 'premium': ltp, 'sec_id': sec_id,
                 'delta': greeks['delta'], 'days_to_exp': days_to_exp,
-                'near_atm': near_atm
+                'near_atm': near_atm, 'greeks': greeks,
             })
 
     best_choice = None
@@ -615,21 +645,45 @@ def select_banknifty_strike(direction: str, budget: float) -> dict:
         log.warning("[BANKNIFTY] No affordable strikes found.")
         return _EMPTY
 
+    vol_mode = False
     if best_choice['delta'] < min_delta:
-        log.warning(
-            f"[BANKNIFTY] Best delta {best_choice['delta']:.2f} < {min_delta} "
-            f"({'expiry γ mode' if on_expiry else 'normal'}) — skipping."
-        )
-        return _EMPTY
+        # ── Volatility-Justified OTM Exception (same logic as Nifty) ──────────
+        b = best_choice
+        iv_annual    = b['greeks'].get('iv_pct', 20.0) / 100.0
+        iv_daily_pts = spot * (iv_annual / (252 ** 0.5))
+        otm_dist_pts = abs(b['strike'] - spot)
+        iv_covers    = otm_dist_pts <= iv_daily_pts * OTM_VOL_IV_MOVE_MULT
+
+        if (b['delta'] >= OTM_VOL_MIN_DELTA and ivr < OTM_VOL_IVR_MAX and iv_covers):
+            vol_mode = True
+            log.info(
+                f"📊 OTM Vol Mode [BANKNIFTY]: IVR={ivr:.0f} < {OTM_VOL_IVR_MAX} ✓ | "
+                f"IV daily {iv_daily_pts:.0f}pts ≥ OTM {otm_dist_pts:.0f}pts / {OTM_VOL_IV_MOVE_MULT} ✓ | "
+                f"δ={b['delta']:.2f} ≥ {OTM_VOL_MIN_DELTA} ✓ | 30-min hold, stagnation exit active"
+            )
+        else:
+            reasons = []
+            if b['delta'] < OTM_VOL_MIN_DELTA:
+                reasons.append(f"δ={b['delta']:.2f} < {OTM_VOL_MIN_DELTA} hard floor")
+            if ivr >= OTM_VOL_IVR_MAX:
+                reasons.append(f"IVR={ivr:.0f} ≥ {OTM_VOL_IVR_MAX} (IV crush risk)")
+            if not iv_covers:
+                reasons.append(f"OTM dist {otm_dist_pts:.0f}pts > IV move {iv_daily_pts:.0f}pts×{OTM_VOL_IV_MOVE_MULT}")
+            log.warning(f"[BANKNIFTY] {b['strike']} {opt_type} blocked: {' | '.join(reasons)}")
+            return _EMPTY
 
     if best_choice['premium'] < MIN_PREMIUM_ENTRY:
         log.warning(f"[BANKNIFTY] Premium ₹{best_choice['premium']:.2f} < ₹{MIN_PREMIUM_ENTRY} — skipping.")
         return _EMPTY
 
-    gamma_tag = " 🎯 GAMMA PLAY" if (on_expiry and best_choice['near_atm']) else ""
+    tags = ""
+    if on_expiry and best_choice['near_atm']:
+        tags += " 🎯 GAMMA PLAY"
+    if vol_mode:
+        tags += " [OTM VOL MODE]"
     log.info(
         f"✅ [BANKNIFTY] {best_choice['strike']} {opt_type} "
-        f"@ ₹{best_choice['premium']:.2f} (δ={best_choice['delta']:.2f}){gamma_tag}"
+        f"@ ₹{best_choice['premium']:.2f} (δ={best_choice['delta']:.2f}){tags}"
     )
     return {
         "security_id":       best_choice['sec_id'],
@@ -638,6 +692,7 @@ def select_banknifty_strike(direction: str, budget: float) -> dict:
         "days_to_expiry":    best_choice['days_to_exp'],
         "simulated_premium": best_choice['premium'],
         "index":             "BANKNIFTY",
+        "vol_mode":          vol_mode,
     }
 
 
