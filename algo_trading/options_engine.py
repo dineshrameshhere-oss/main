@@ -448,6 +448,156 @@ def calculate_qty(budget: float, option_premium: float, is_strong_conviction: bo
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  SENSEX BSE OPTIONS  (fallback when Nifty delta-gate fires)
+#  Sensex lot size = 10 → ATM ~₹300 × 10 = ₹3K, fits small budgets.
+#  Uses same directional signal as Nifty (0.97 correlation).
+# ─────────────────────────────────────────────────────────────────────────────
+_SENSEX_INSTRUMENTS_DF = None
+
+
+def _get_sensex_instruments() -> pd.DataFrame:
+    """Load BSE FNO instruments for Sensex options. Cached for session."""
+    global _SENSEX_INSTRUMENTS_DF
+    if _SENSEX_INSTRUMENTS_DF is not None:
+        return _SENSEX_INSTRUMENTS_DF
+    try:
+        url = f"{INDSTOCKS_BASE}/market/instruments?source=bse_fno"
+        res = requests.get(url, headers=get_auth_headers(), timeout=10)
+        if res.status_code == 200:
+            df = pd.read_csv(io.StringIO(res.text))
+            df.columns = df.columns.str.strip().str.upper()
+            df['EXPIRY_DATE'] = pd.to_datetime(df['EXPIRY_DATE'], errors='coerce')
+            _SENSEX_INSTRUMENTS_DF = df
+            log.info(f"[SENSEX] BSE instruments loaded: {len(df)} rows")
+            return df
+        log.warning(f"[SENSEX] BSE instruments API {res.status_code}: {res.text[:80]}")
+    except Exception as e:
+        log.warning(f"[SENSEX] Instruments load error: {e}")
+    _SENSEX_INSTRUMENTS_DF = pd.DataFrame()
+    return pd.DataFrame()
+
+
+def fetch_sensex_spot() -> float:
+    """
+    Returns current Sensex level.
+    Primary: BSE scrip LTP. Fallback: infer from Nifty spot × ~3.38 ratio.
+    """
+    try:
+        from .config import SENSEX_SCRIP_CODE
+        url = f"{INDSTOCKS_BASE}/market/quotes/ltp?scrip-codes={SENSEX_SCRIP_CODE}"
+        res = requests.get(url, headers=get_auth_headers(), timeout=5)
+        if res.status_code == 200:
+            ltp = float(res.json().get('data', {}).get(SENSEX_SCRIP_CODE, {}).get('live_price', 0))
+            if ltp > 50000:
+                return ltp
+    except Exception as e:
+        log.warning(f"[SENSEX] Spot fetch error: {e}")
+    # Fallback: Sensex ≈ Nifty × 3.38 (approximate ratio, updated periodically)
+    nifty = fetch_nifty_spot()
+    return round(nifty * 3.38 / 100) * 100
+
+
+def _fetch_bse_option_ltp(scrip_code: str) -> float:
+    """Fetches live BSE option LTP. scrip_code format: 'BFO_<SECURITY_ID>'"""
+    try:
+        url = f"{INDSTOCKS_BASE}/market/quotes/ltp?scrip-codes={scrip_code}"
+        res = requests.get(url, headers=get_auth_headers(), timeout=5)
+        if res.status_code == 200:
+            return float(res.json().get('data', {}).get(scrip_code, {}).get('live_price', 0))
+    except Exception as e:
+        log.warning(f"[SENSEX] LTP fetch error for {scrip_code}: {e}")
+    return 0.0
+
+
+def select_sensex_strike(direction: str, budget: float) -> dict:
+    """
+    Finds a quality Sensex BSE option strike using the same logic as select_strike.
+    Sensex lot size = 10 units — very affordable ATM options for small budgets.
+    Returns dict with security_id (BFO_ prefix), strike, simulated_premium, exchange='BSE'.
+    Returns simulated_premium=0.0 if no quality strike found.
+    """
+    from .indicators import compute_greeks
+    from .config import SENSEX_LOT_SIZE, MIN_DELTA_ENTRY, MIN_PREMIUM_ENTRY
+
+    opt_type = "CE" if "LONG" in direction else "PE"
+    spot     = fetch_sensex_spot()
+    atm      = round(spot / 100) * 100   # Sensex strikes at 100-pt intervals
+
+    _EMPTY = {"security_id": "", "strike": atm, "type": opt_type,
+               "days_to_expiry": 7, "simulated_premium": 0.0, "exchange": "BSE"}
+
+    strikes = [atm + (i * 100) for i in range(-5, 6)]
+    log.info(f"[SENSEX] Searching {opt_type} strikes around ATM {atm} | Budget ₹{budget:.0f} | Lot {SENSEX_LOT_SIZE}")
+
+    df = _get_sensex_instruments()
+    if df.empty:
+        log.warning("[SENSEX] No BSE instruments — Sensex fallback unavailable.")
+        return _EMPTY
+
+    today = pd.to_datetime(datetime.date.today())
+    sensex_opts = df[
+        df['TRADING_SYMBOL'].str.upper().str.contains('SENSEX', na=False) &
+        df['INSTRUMENT_NAME'].isin(['OPTIDX', 'IO']) &
+        (df['OPTION_TYPE'] == opt_type) &
+        (df['EXPIRY_DATE'] >= today)
+    ].copy()
+
+    if sensex_opts.empty:
+        log.warning("[SENSEX] No Sensex options in BSE instruments.")
+        return _EMPTY
+
+    near_expiry  = sensex_opts['EXPIRY_DATE'].min()
+    near_opts    = sensex_opts[sensex_opts['EXPIRY_DATE'] == near_expiry]
+    days_to_exp  = max(1, (near_expiry.date() - datetime.date.today()).days)
+
+    candidates = []
+    for strike in strikes:
+        row = near_opts[near_opts['STRIKE_PRICE'] == float(strike)]
+        if row.empty:
+            continue
+        sec_id = f"BFO_{int(row.iloc[0]['SECURITY_ID'])}"
+        ltp    = _fetch_bse_option_ltp(sec_id)
+        if ltp <= 0:
+            continue
+        greeks = compute_greeks(spot, strike, days_to_exp, ltp, opt_type)
+        cost   = ltp * SENSEX_LOT_SIZE
+        log.info(f"  [SENSEX] {strike} {opt_type}: ₹{ltp:.2f} | δ={greeks['delta']:.2f} | Cost ₹{cost:.0f}")
+        if cost <= budget:
+            candidates.append({'strike': strike, 'premium': ltp, 'sec_id': sec_id,
+                                'delta': greeks['delta'], 'days_to_exp': days_to_exp})
+
+    best_choice = None
+    quality = [c for c in candidates if 0.40 <= c['delta'] <= 0.65]
+    if quality:
+        best_choice = max(quality, key=lambda x: x['delta'])
+    elif candidates:
+        best_choice = max(candidates, key=lambda x: x['delta'])
+
+    if not best_choice:
+        log.warning("[SENSEX] No affordable strikes found.")
+        return _EMPTY
+
+    if best_choice['delta'] < MIN_DELTA_ENTRY:
+        log.warning(f"[SENSEX] Best delta {best_choice['delta']:.2f} < {MIN_DELTA_ENTRY} — skipping.")
+        return _EMPTY
+
+    if best_choice['premium'] < MIN_PREMIUM_ENTRY:
+        log.warning(f"[SENSEX] Premium ₹{best_choice['premium']:.2f} < ₹{MIN_PREMIUM_ENTRY} — skipping.")
+        return _EMPTY
+
+    log.info(f"✅ [SENSEX] Quality Match: SENSEX {best_choice['strike']} {opt_type} "
+             f"@ ₹{best_choice['premium']:.2f} (δ={best_choice['delta']:.2f})")
+    return {
+        "security_id":       best_choice['sec_id'],
+        "strike":            best_choice['strike'],
+        "type":              opt_type,
+        "days_to_expiry":    best_choice['days_to_exp'],
+        "simulated_premium": best_choice['premium'],
+        "exchange":          "BSE",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  LEGACY shim — kept for any imports still using old name
 # ─────────────────────────────────────────────────────────────────────────────
 def get_instruments():

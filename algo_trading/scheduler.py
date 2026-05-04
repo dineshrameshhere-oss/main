@@ -22,7 +22,8 @@ from .indicators import (
     compute_greeks, check_rv_gate, compute_mtf_trend_score
 )
 from .llm_analyst import analyze_premarket, analyze_market_open
-from .options_engine import select_strike, calculate_qty, calculate_dynamic_risk, compute_pcr
+from .options_engine import (select_strike, calculate_qty, calculate_dynamic_risk, compute_pcr,
+                             select_sensex_strike)
 from .trade_executor import place_order, get_balance, close_order, square_off_all_open_positions
 from .risk_manager import monitor_position
 
@@ -322,44 +323,56 @@ def execute_scalp_trade(rating_score: float, direction: str,
         log.info(f"  📊 PCR={pcr.get('pcr',1.0):.2f} ({pcr.get('bias','N/A')}) | included in composite score")
 
 
-    # ── 4. Strike selection ───────────────────────────────────────────────
+    # ── 4. Strike selection (Nifty first, Sensex fallback) ────────────────
     spot        = float(df['Close'].iloc[-1])
     strike_info = select_strike(direction, spot, current_balance)
     premium     = strike_info.get('simulated_premium', 0.0)
 
     if premium <= 0:
-        log.warning("⚠️ No valid live premium — skipping trade.")
-        return
+        # Nifty delta-gate fired (budget too tight for quality strike).
+        # Try Sensex options — lot size = 10, ATM ~₹300 × 10 = ₹3K.
+        log.info("ℹ️ Nifty strike blocked — checking Sensex BSE options as fallback...")
+        strike_info = select_sensex_strike(direction, current_balance)
+        premium     = strike_info.get('simulated_premium', 0.0)
+        if premium <= 0:
+            log.warning("⚠️ Sensex also has no quality strike — skipping trade this cycle.")
+            return
+        log.info(f"🔀 Switching to SENSEX options for this trade (direction: {direction})")
 
-    # select_strike internally corrects a scaled spot (<10000) to real Nifty level.
-    # Use the strike itself as best proxy for ATM spot when df is stale/scaled.
+    # Correct scaled spot for Greeks calculation.
+    # select_strike/select_sensex_strike already used real spot internally.
+    # For NSE: use strike as proxy if df Close is scaled (~1081).
+    # For BSE: use strike as proxy always (Sensex spot already correct inside select_sensex_strike).
     if spot < 10000:
         spot = float(strike_info['strike'])
 
-    # ── Greeks: score contribution (no hard gate) ──────────────────────────────
+    # ── Greeks check ───────────────────────────────────────────────────────
     opt_type    = 'CE' if direction == 'SCALP_LONG' else 'PE'
     days_to_exp = strike_info.get('days_to_expiry', 7)
     greeks      = compute_greeks(spot, strike_info['strike'], days_to_exp, premium, opt_type)
-    # Delta score: deep OTM options (delta<0.2) lower score but don't block
     greek_bonus = 0.0
-    if   greeks['delta'] >= 0.45: greek_bonus = +0.08  # near ATM — good sensitivity
+    if   greeks['delta'] >= 0.45: greek_bonus = +0.08
     elif greeks['delta'] >= 0.30: greek_bonus = +0.03
-    elif greeks['delta'] <  0.15: greek_bonus = -0.10  # deep OTM — penalise
-    
-    # Check if Greek adjustment pulls score below execution threshold
-    # For SELL signals (negative score), we check if score + bonus is > -threshold
+    elif greeks['delta'] <  0.15: greek_bonus = -0.10
+
     is_long = direction == 'SCALP_LONG'
     effective_score = rating_score + (greek_bonus if is_long else -greek_bonus)
     threshold = RATING_STRONG_BUY * 0.90
-    
+
     if (is_long and effective_score < threshold) or (not is_long and effective_score > -threshold):
         log.warning(f"⚠️ Greek penalty pulls score below threshold — δ={greeks['delta']:.3f} | Skipping.")
         return
     log.info(f"  ✅ Greeks — δ={greeks['delta']:.3f} γ={greeks['gamma']:.5f} "
              f"θ={greeks['theta']:.1f}₹/day IV={greeks['iv_pct']:.0f}% greek_bonus={greek_bonus:+.2f}")
 
-    is_strong = abs(rating_score) >= 0.85
-    qty, cost, _ = calculate_qty(current_balance, premium, is_strong_conviction=is_strong)
+    is_exchange = strike_info.get('exchange', 'NSE')
+    is_sensex   = is_exchange == 'BSE'
+    is_strong   = abs(rating_score) >= 0.85
+
+    from .config import SENSEX_LOT_SIZE
+    lot_size_to_use = SENSEX_LOT_SIZE if is_sensex else None   # None → uses config.LOT_SIZE
+    qty, cost, _ = calculate_qty(current_balance, premium, is_strong_conviction=is_strong,
+                                  lot_size=lot_size_to_use)
     if qty == 0:
         log.warning(f"⚠️ Insufficient balance for 1 lot @ ₹{premium:.2f}.")
         return
@@ -368,13 +381,13 @@ def execute_scalp_trade(rating_score: float, direction: str,
     sl_price = round(premium * (1 - sl_pct), 2)
     tp_price = round(premium * (1 + tp_pct), 2)
 
-    # OI coverage for log (from rating breakdown if available)
-    bd       = getattr(state, 'last_breakdown', {})
-    oi_type  = bd.get('oi_coverage', 'N/A')
+    bd      = getattr(state, 'last_breakdown', {})
+    oi_type = bd.get('oi_coverage', 'N/A')
+    index_label = 'SENSEX' if is_sensex else 'NIFTY'
     log.info(
-        f"🎯 NIFTY {strike_info['strike']} {opt_type} | "
+        f"🎯 {index_label} {strike_info['strike']} {opt_type} | "
         f"Premium ₹{premium:.2f} | Qty {qty} | Cost ₹{cost:.0f} | "
-        f"SL ₹{sl_price:.2f} | TP ₹{tp_price:.2f} | "
+        f"SL ₹{sl_price:.2f} ({sl_pct*100:.0f}%) | TP ₹{tp_price:.2f} | "
         f"Score {rating_score:+.2f} | OI:{oi_type}"
     )
 
