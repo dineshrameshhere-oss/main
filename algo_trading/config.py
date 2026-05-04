@@ -13,12 +13,27 @@ NIFTY_EXCHANGE    = "NSE"
 PRODUCT_TYPE      = "MARGIN"
 ALGO_ID           = "99999"
 
-# ── Sensex BSE Options (fallback when Nifty delta-gate blocks entry) ──────────
-# BSE Sensex lot size = 10 units — ATM option ~₹300 × 10 = ₹3K, fits ₹5K budget
-# Strikes in 100-point intervals. Weekly Friday expiry on BSE.
-SENSEX_LOT_SIZE  = 10
-SENSEX_EXCHANGE  = 'BSE'
-SENSEX_SCRIP_CODE = 'BSE_1'    # BSE Sensex index scrip code
+# ── BankNifty NSE Options (fallback when Nifty delta-gate fires) ─────────────
+# BankNifty lot size = 15 units. ATM ~₹320 × 15 = ₹4,800 — fits ₹5K budget.
+# BankNifty is 2-3× more volatile than Nifty (400-600pt daily swings common).
+# That volatility is what compensates for slightly lower delta on affordable strikes:
+#   → BankNifty moves 400pts → ATM option gains ₹160 on ₹320 entry = +50%
+#   → BankNifty moves 700pts → ATM option gains ₹400+ = +125%
+# Expiry: Wednesday (weekly). Strikes in 100-point intervals.
+BANKNIFTY_LOT_SIZE = 15
+
+# ── Sensex BSE Options ─────────────────────────────────────────────────────────
+# ANALYSIS: Sensex lot size = 20, ATM ₹500-700 → cost ₹10,000-14,000 per lot.
+# NOT viable for budgets under ₹15K. Left here for future reference only.
+SENSEX_LOT_SIZE   = 20
+SENSEX_EXCHANGE   = 'BSE'
+SENSEX_SCRIP_CODE = 'BSE_1'
+
+# ── Expiry-Day Gamma Mode ─────────────────────────────────────────────────────
+# On expiry day (Nifty=Thursday, BankNifty=Wednesday), gamma is 3-5× higher.
+# A delta-0.15 option near ATM can move 200-400% on a 100pt underlying move.
+# Lower the delta gate ONLY on expiry day + near ATM (within 2 strikes) + strong signal.
+MIN_DELTA_ENTRY_EXPIRY = 0.12   # expiry-day gamma play (normal: 0.25)
 
 # ── Scalping Bot Safety Net ───────────────────────────────────────────────────
 # If 0 trades by 12:30 IST, relax STRONG_BUY from 0.45 → 0.40 for afternoon.
@@ -62,6 +77,24 @@ LOT_SCALE_TIERS = [
 # Hard stops before placing any trade. Better to miss a trade than take a bad one.
 MIN_DELTA_ENTRY   = 0.25   # Minimum delta: below this, option barely moves per Nifty point
 MIN_PREMIUM_ENTRY = 40.0   # Minimum premium ₹: below this, bid-ask spread eats SL instantly
+
+# ── Volatility-Justified OTM Mode ────────────────────────────────────────────
+# Allow delta < 0.25 (OTM) ONLY when ALL three conditions hold simultaneously:
+#   1. IVR < OTM_VOL_IVR_MAX  → options are CHEAP. Buying before IV expansion, not after.
+#      (If IVR is already high, the move is priced in. Any rally = IV crush = loss.)
+#   2. Score >= OTM_VOL_MIN_SCORE → every signal (RSI/ADX/PCR/MTF/MACD) must agree.
+#      OTM needs a large, fast move. Marginal signals don't produce those.
+#   3. OTM distance <= IV-implied daily move × OTM_VOL_IV_MOVE_MULT
+#      → statistical validation the strike has a real chance of going ITM today.
+# Profit mechanism: cheap OTM + strong move + IV expansion = 50-200%+ gain.
+# Risk: theta bleeds OTM fast. Hard 30-min hold cap and stagnation exit enforce speed.
+OTM_VOL_IVR_MAX      = 45     # IVR ceiling — above this, IV crush risk outweighs upside
+OTM_VOL_MIN_DELTA    = 0.15   # Hard floor even in vol mode (below this = lottery ticket)
+OTM_VOL_MIN_SCORE    = 0.85   # Max-conviction only — all signals must agree
+OTM_VOL_MAX_HOLD_MIN = 30     # 30-min max hold — theta acceleration kills OTM past this
+OTM_VOL_IV_MOVE_MULT = 1.5    # OTM distance must be ≤ IV-implied daily move × this
+OTM_STAGNATION_TICKS = 90     # 15 min at 10s/tick — start stagnation watch after this
+OTM_STAGNATION_PCT   = -0.08  # Exit if PnL < -8% with no improving trend (theta trap)
 
 # LLM Config
 GEMINI_MODEL      = "gemini-2.0-flash"

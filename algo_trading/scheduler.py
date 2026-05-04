@@ -23,7 +23,7 @@ from .indicators import (
 )
 from .llm_analyst import analyze_premarket, analyze_market_open
 from .options_engine import (select_strike, calculate_qty, calculate_dynamic_risk, compute_pcr,
-                             select_sensex_strike)
+                             select_banknifty_strike)
 from .trade_executor import place_order, get_balance, close_order, square_off_all_open_positions
 from .risk_manager import monitor_position
 
@@ -295,7 +295,8 @@ def _on_position_closed(pnl: float = 0.0):
 #  TRADE EXECUTION
 # ─────────────────────────────────────────────────────────────────────────────
 def execute_scalp_trade(rating_score: float, direction: str,
-                        df_enriched=None, pcr: dict | None = None):
+                        df_enriched=None, pcr: dict | None = None,
+                        ivr_data: dict | None = None):
     """Enters a trade after passing all quality filters."""
     if state.daily_trades >= 3:
         log.warning("🚫 Max 3 trades/day reached.")
@@ -323,26 +324,41 @@ def execute_scalp_trade(rating_score: float, direction: str,
         log.info(f"  📊 PCR={pcr.get('pcr',1.0):.2f} ({pcr.get('bias','N/A')}) | included in composite score")
 
 
-    # ── 4. Strike selection (Nifty first, Sensex fallback) ────────────────
+    # ── 4. Strike selection (Nifty first, BankNifty fallback) ────────────
+    from .config import OTM_VOL_MIN_SCORE, OTM_VOL_MAX_HOLD_MIN, OTM_STAGNATION_TICKS
+
     spot        = float(df['Close'].iloc[-1])
-    strike_info = select_strike(direction, spot, current_balance)
+    ivr         = ivr_data.get('ivr', 50.0) if ivr_data else 50.0
+    strike_info = select_strike(direction, spot, current_balance, ivr=ivr)
     premium     = strike_info.get('simulated_premium', 0.0)
 
     if premium <= 0:
-        # Nifty delta-gate fired (budget too tight for quality strike).
-        # Try Sensex options — lot size = 10, ATM ~₹300 × 10 = ₹3K.
-        log.info("ℹ️ Nifty strike blocked — checking Sensex BSE options as fallback...")
-        strike_info = select_sensex_strike(direction, current_balance)
+        # Nifty delta-gate fired — try BankNifty (lot 15, ATM fits ₹5K budget).
+        log.info("ℹ️ Nifty strike blocked — checking BankNifty NSE options as fallback...")
+        strike_info = select_banknifty_strike(direction, current_balance, ivr=ivr)
         premium     = strike_info.get('simulated_premium', 0.0)
         if premium <= 0:
-            log.warning("⚠️ Sensex also has no quality strike — skipping trade this cycle.")
+            log.warning("⚠️ BankNifty also has no quality strike — skipping trade this cycle.")
             return
-        log.info(f"🔀 Switching to SENSEX options for this trade (direction: {direction})")
+        log.info(f"🔀 Switching to BANKNIFTY options for this trade (direction: {direction})")
+
+    # ── Vol-mode gate: OTM entries require max-conviction score ───────────
+    vol_mode = strike_info.get('vol_mode', False)
+    if vol_mode and abs(rating_score) < OTM_VOL_MIN_SCORE:
+        log.warning(
+            f"🚫 OTM Vol Mode blocked: score {rating_score:+.2f} needs ±{OTM_VOL_MIN_SCORE}. "
+            f"Signals not strong enough to justify OTM risk — skipping."
+        )
+        return
+    if vol_mode:
+        log.info(
+            f"⚡ OTM VOL MODE | Score {rating_score:+.2f} ≥ {OTM_VOL_MIN_SCORE} ✓ | "
+            f"Max hold: {OTM_VOL_MAX_HOLD_MIN}min | Stagnation exit after 15min"
+        )
 
     # Correct scaled spot for Greeks calculation.
-    # select_strike/select_sensex_strike already used real spot internally.
-    # For NSE: use strike as proxy if df Close is scaled (~1081).
-    # For BSE: use strike as proxy always (Sensex spot already correct inside select_sensex_strike).
+    # select_strike/select_banknifty_strike already used real spot internally.
+    # Use strike as spot proxy if df Close is scaled (~1081).
     if spot < 10000:
         spot = float(strike_info['strike'])
 
@@ -365,12 +381,11 @@ def execute_scalp_trade(rating_score: float, direction: str,
     log.info(f"  ✅ Greeks — δ={greeks['delta']:.3f} γ={greeks['gamma']:.5f} "
              f"θ={greeks['theta']:.1f}₹/day IV={greeks['iv_pct']:.0f}% greek_bonus={greek_bonus:+.2f}")
 
-    is_exchange = strike_info.get('exchange', 'NSE')
-    is_sensex   = is_exchange == 'BSE'
-    is_strong   = abs(rating_score) >= 0.85
+    is_banknifty = strike_info.get('index') == 'BANKNIFTY'
+    is_strong    = abs(rating_score) >= 0.85
 
-    from .config import SENSEX_LOT_SIZE
-    lot_size_to_use = SENSEX_LOT_SIZE if is_sensex else None   # None → uses config.LOT_SIZE
+    from .config import BANKNIFTY_LOT_SIZE
+    lot_size_to_use = BANKNIFTY_LOT_SIZE if is_banknifty else None   # None → uses config.LOT_SIZE
     qty, cost, _ = calculate_qty(current_balance, premium, is_strong_conviction=is_strong,
                                   lot_size=lot_size_to_use)
     if qty == 0:
@@ -381,9 +396,9 @@ def execute_scalp_trade(rating_score: float, direction: str,
     sl_price = round(premium * (1 - sl_pct), 2)
     tp_price = round(premium * (1 + tp_pct), 2)
 
-    bd      = getattr(state, 'last_breakdown', {})
-    oi_type = bd.get('oi_coverage', 'N/A')
-    index_label = 'SENSEX' if is_sensex else 'NIFTY'
+    bd          = getattr(state, 'last_breakdown', {})
+    oi_type     = bd.get('oi_coverage', 'N/A')
+    index_label = 'BANKNIFTY' if is_banknifty else 'NIFTY'
     log.info(
         f"🎯 {index_label} {strike_info['strike']} {opt_type} | "
         f"Premium ₹{premium:.2f} | Qty {qty} | Cost ₹{cost:.0f} | "
@@ -397,6 +412,11 @@ def execute_scalp_trade(rating_score: float, direction: str,
     )
     if not order:
         return
+
+    # Tag OTM vol mode onto the order so the monitor thread enforces speed rules
+    if vol_mode:
+        order['otm_vol_mode'] = True
+        order['max_hold_min'] = OTM_VOL_MAX_HOLD_MIN
 
     # Monitor thread takes over
     with state.active_position_lock:
@@ -544,27 +564,27 @@ def scalp_poll():
     # If Gemini pre-market analysis is enabled and has a bias, we follow it.
     if state.use_ai:
         premarket_bias = state.premarket_analysis.get('strategy_suggestion', 'WAIT')
-        
+
         if score >= _strong_thresh and prev_score < _strong_thresh:
             if premarket_bias == 'BEARISH':
                 log.warning(f"⚠️ STRONG BUY blocked by LLM BEARISH bias ({premarket_bias})")
                 return
             log.info(f"🟢 STRONG BUY crossed +{RATING_STRONG_BUY} → Buy CE")
-            execute_scalp_trade(score, 'SCALP_LONG', df_enriched=df_5m, pcr=pcr_data)
+            execute_scalp_trade(score, 'SCALP_LONG', df_enriched=df_5m, pcr=pcr_data, ivr_data=ivr_data)
         elif score <= -_strong_thresh and prev_score > -_strong_thresh:
             if premarket_bias == 'BULLISH':
                 log.warning(f"⚠️ STRONG SELL blocked by LLM BULLISH bias ({premarket_bias})")
                 return
             log.info(f"🔴 STRONG SELL crossed {RATING_STRONG_SELL} → Buy PE")
-            execute_scalp_trade(score, 'SCALP_SHORT', df_enriched=df_5m, pcr=pcr_data)
+            execute_scalp_trade(score, 'SCALP_SHORT', df_enriched=df_5m, pcr=pcr_data, ivr_data=ivr_data)
     else:
         # Standard execution without AI bias
         if score >= _strong_thresh and prev_score < _strong_thresh:
             log.info(f"🟢 STRONG BUY crossed +{RATING_STRONG_BUY} → Buy CE")
-            execute_scalp_trade(score, 'SCALP_LONG', df_enriched=df_5m, pcr=pcr_data)
+            execute_scalp_trade(score, 'SCALP_LONG', df_enriched=df_5m, pcr=pcr_data, ivr_data=ivr_data)
         elif score <= -_strong_thresh and prev_score > -_strong_thresh:
             log.info(f"🔴 STRONG SELL crossed {RATING_STRONG_SELL} → Buy PE")
-            execute_scalp_trade(score, 'SCALP_SHORT', df_enriched=df_5m, pcr=pcr_data)
+            execute_scalp_trade(score, 'SCALP_SHORT', df_enriched=df_5m, pcr=pcr_data, ivr_data=ivr_data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
