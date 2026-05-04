@@ -23,7 +23,7 @@ from .indicators import (
 )
 from .llm_analyst import analyze_premarket, analyze_market_open
 from .options_engine import (select_strike, calculate_qty, calculate_dynamic_risk, compute_pcr,
-                             select_sensex_strike)
+                             select_banknifty_strike)
 from .trade_executor import place_order, get_balance, close_order, square_off_all_open_positions
 from .risk_manager import monitor_position
 
@@ -330,19 +330,19 @@ def execute_scalp_trade(rating_score: float, direction: str,
 
     if premium <= 0:
         # Nifty delta-gate fired (budget too tight for quality strike).
-        # Try Sensex options — lot size = 10, ATM ~₹300 × 10 = ₹3K.
-        log.info("ℹ️ Nifty strike blocked — checking Sensex BSE options as fallback...")
-        strike_info = select_sensex_strike(direction, current_balance)
+        # Try BankNifty — lot size 15, ATM ~₹280-380 × 15 = ₹4,200-5,700.
+        # BankNifty is 2-3× more volatile than Nifty — same signal, more ₹ gain.
+        log.info("ℹ️ Nifty strike blocked — checking BankNifty NSE options as fallback...")
+        strike_info = select_banknifty_strike(direction, current_balance)
         premium     = strike_info.get('simulated_premium', 0.0)
         if premium <= 0:
-            log.warning("⚠️ Sensex also has no quality strike — skipping trade this cycle.")
+            log.warning("⚠️ BankNifty also has no quality strike — skipping trade this cycle.")
             return
-        log.info(f"🔀 Switching to SENSEX options for this trade (direction: {direction})")
+        log.info(f"🔀 Switching to BANKNIFTY options for this trade (direction: {direction})")
 
     # Correct scaled spot for Greeks calculation.
-    # select_strike/select_sensex_strike already used real spot internally.
-    # For NSE: use strike as proxy if df Close is scaled (~1081).
-    # For BSE: use strike as proxy always (Sensex spot already correct inside select_sensex_strike).
+    # select_strike/select_banknifty_strike already used real spot internally.
+    # Use strike as spot proxy if df Close is scaled (~1081).
     if spot < 10000:
         spot = float(strike_info['strike'])
 
@@ -365,12 +365,11 @@ def execute_scalp_trade(rating_score: float, direction: str,
     log.info(f"  ✅ Greeks — δ={greeks['delta']:.3f} γ={greeks['gamma']:.5f} "
              f"θ={greeks['theta']:.1f}₹/day IV={greeks['iv_pct']:.0f}% greek_bonus={greek_bonus:+.2f}")
 
-    is_exchange = strike_info.get('exchange', 'NSE')
-    is_sensex   = is_exchange == 'BSE'
-    is_strong   = abs(rating_score) >= 0.85
+    is_banknifty = strike_info.get('index') == 'BANKNIFTY'
+    is_strong    = abs(rating_score) >= 0.85
 
-    from .config import SENSEX_LOT_SIZE
-    lot_size_to_use = SENSEX_LOT_SIZE if is_sensex else None   # None → uses config.LOT_SIZE
+    from .config import BANKNIFTY_LOT_SIZE
+    lot_size_to_use = BANKNIFTY_LOT_SIZE if is_banknifty else None   # None → uses config.LOT_SIZE
     qty, cost, _ = calculate_qty(current_balance, premium, is_strong_conviction=is_strong,
                                   lot_size=lot_size_to_use)
     if qty == 0:
@@ -381,9 +380,9 @@ def execute_scalp_trade(rating_score: float, direction: str,
     sl_price = round(premium * (1 - sl_pct), 2)
     tp_price = round(premium * (1 + tp_pct), 2)
 
-    bd      = getattr(state, 'last_breakdown', {})
-    oi_type = bd.get('oi_coverage', 'N/A')
-    index_label = 'SENSEX' if is_sensex else 'NIFTY'
+    bd          = getattr(state, 'last_breakdown', {})
+    oi_type     = bd.get('oi_coverage', 'N/A')
+    index_label = 'BANKNIFTY' if is_banknifty else 'NIFTY'
     log.info(
         f"🎯 {index_label} {strike_info['strike']} {opt_type} | "
         f"Premium ₹{premium:.2f} | Qty {qty} | Cost ₹{cost:.0f} | "

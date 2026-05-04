@@ -13,12 +13,27 @@ NIFTY_EXCHANGE    = "NSE"
 PRODUCT_TYPE      = "MARGIN"
 ALGO_ID           = "99999"
 
-# ── Sensex BSE Options (fallback when Nifty delta-gate blocks entry) ──────────
-# BSE Sensex lot size = 10 units — ATM option ~₹300 × 10 = ₹3K, fits ₹5K budget
-# Strikes in 100-point intervals. Weekly Friday expiry on BSE.
-SENSEX_LOT_SIZE  = 10
-SENSEX_EXCHANGE  = 'BSE'
-SENSEX_SCRIP_CODE = 'BSE_1'    # BSE Sensex index scrip code
+# ── BankNifty NSE Options (fallback when Nifty delta-gate fires) ─────────────
+# BankNifty lot size = 15 units. ATM ~₹320 × 15 = ₹4,800 — fits ₹5K budget.
+# BankNifty is 2-3× more volatile than Nifty (400-600pt daily swings common).
+# That volatility is what compensates for slightly lower delta on affordable strikes:
+#   → BankNifty moves 400pts → ATM option gains ₹160 on ₹320 entry = +50%
+#   → BankNifty moves 700pts → ATM option gains ₹400+ = +125%
+# Expiry: Wednesday (weekly). Strikes in 100-point intervals.
+BANKNIFTY_LOT_SIZE = 15
+
+# ── Sensex BSE Options ─────────────────────────────────────────────────────────
+# ANALYSIS: Sensex lot size = 20, ATM ₹500-700 → cost ₹10,000-14,000 per lot.
+# NOT viable for budgets under ₹15K. Left here for future reference only.
+SENSEX_LOT_SIZE   = 20
+SENSEX_EXCHANGE   = 'BSE'
+SENSEX_SCRIP_CODE = 'BSE_1'
+
+# ── Expiry-Day Gamma Mode ─────────────────────────────────────────────────────
+# On expiry day (Nifty=Thursday, BankNifty=Wednesday), gamma is 3-5× higher.
+# A delta-0.15 option near ATM can move 200-400% on a 100pt underlying move.
+# Lower the delta gate ONLY on expiry day + near ATM (within 2 strikes) + strong signal.
+MIN_DELTA_ENTRY_EXPIRY = 0.12   # expiry-day gamma play (normal: 0.25)
 
 # ── Scalping Bot Safety Net ───────────────────────────────────────────────────
 # If 0 trades by 12:30 IST, relax STRONG_BUY from 0.45 → 0.40 for afternoon.

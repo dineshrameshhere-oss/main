@@ -1,6 +1,8 @@
 from .logger import log
 from . import config
-from .config import INDSTOCKS_BASE, PCR_BULLISH_MAX, PCR_BEARISH_MIN, MIN_DELTA_ENTRY, MIN_PREMIUM_ENTRY
+from .config import (INDSTOCKS_BASE, PCR_BULLISH_MAX, PCR_BEARISH_MIN,
+                     MIN_DELTA_ENTRY, MIN_DELTA_ENTRY_EXPIRY, MIN_PREMIUM_ENTRY,
+                     BANKNIFTY_LOT_SIZE)
 from .market_data import fetch_ltp, get_auth_headers
 import requests
 import pandas as pd
@@ -348,10 +350,18 @@ def select_strike(direction: str, spot_price: float, budget: float) -> dict:
 
     if best_choice:
         # ── Hard quality gates ─────────────────────────────────────────────
-        if best_choice['delta'] < MIN_DELTA_ENTRY:
+        # On expiry day (Thursday) + near ATM (within 1 strike = 50pts),
+        # gamma is 3-5× higher — allow lower delta for gamma plays.
+        on_expiry = _is_expiry_day('NIFTY')
+        is_near_atm = abs(best_choice['strike'] - atm) <= 50
+        min_delta_effective = MIN_DELTA_ENTRY_EXPIRY if (on_expiry and is_near_atm) else MIN_DELTA_ENTRY
+        if on_expiry and is_near_atm:
+            log.info(f"⚡ Expiry-day gamma mode active — min delta relaxed to {MIN_DELTA_ENTRY_EXPIRY}")
+
+        if best_choice['delta'] < min_delta_effective:
             log.warning(
                 f"🚫 Best affordable strike {best_choice['strike']} {opt_type} "
-                f"has delta {best_choice['delta']:.2f} < {MIN_DELTA_ENTRY} minimum. "
+                f"has delta {best_choice['delta']:.2f} < {min_delta_effective} minimum. "
                 f"Skipping trade — budget too tight for quality strike."
             )
             return {"security_id": f"NFO_DUMMY_{int(atm)}_{opt_type}", "strike": atm,
@@ -448,152 +458,186 @@ def calculate_qty(budget: float, option_premium: float, is_strong_conviction: bo
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SENSEX BSE OPTIONS  (fallback when Nifty delta-gate fires)
-#  Sensex lot size = 10 → ATM ~₹300 × 10 = ₹3K, fits small budgets.
-#  Uses same directional signal as Nifty (0.97 correlation).
+#  EXPIRY-DAY DETECTION
 # ─────────────────────────────────────────────────────────────────────────────
-_SENSEX_INSTRUMENTS_DF = None
-
-
-def _get_sensex_instruments() -> pd.DataFrame:
-    """Load BSE FNO instruments for Sensex options. Cached for session."""
-    global _SENSEX_INSTRUMENTS_DF
-    if _SENSEX_INSTRUMENTS_DF is not None:
-        return _SENSEX_INSTRUMENTS_DF
-    try:
-        url = f"{INDSTOCKS_BASE}/market/instruments?source=bse_fno"
-        res = requests.get(url, headers=get_auth_headers(), timeout=10)
-        if res.status_code == 200:
-            df = pd.read_csv(io.StringIO(res.text))
-            df.columns = df.columns.str.strip().str.upper()
-            df['EXPIRY_DATE'] = pd.to_datetime(df['EXPIRY_DATE'], errors='coerce')
-            _SENSEX_INSTRUMENTS_DF = df
-            log.info(f"[SENSEX] BSE instruments loaded: {len(df)} rows")
-            return df
-        log.warning(f"[SENSEX] BSE instruments API {res.status_code}: {res.text[:80]}")
-    except Exception as e:
-        log.warning(f"[SENSEX] Instruments load error: {e}")
-    _SENSEX_INSTRUMENTS_DF = pd.DataFrame()
-    return pd.DataFrame()
-
-
-def fetch_sensex_spot() -> float:
+def _is_expiry_day(index: str = 'NIFTY') -> bool:
     """
-    Returns current Sensex level.
-    Primary: BSE scrip LTP. Fallback: infer from Nifty spot × ~3.38 ratio.
+    Returns True if today is the weekly expiry day for the given index.
+    Nifty: Thursday (weekday=3). BankNifty: Wednesday (weekday=2).
+    """
+    today = datetime.date.today()
+    if index.upper() == 'BANKNIFTY':
+        return today.weekday() == 2   # Wednesday
+    return today.weekday() == 3       # Thursday
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  BANKNIFTY SPOT PRICE
+# ─────────────────────────────────────────────────────────────────────────────
+def fetch_banknifty_spot() -> float:
+    """
+    Returns the current BankNifty spot level by scanning near-expiry ATM options
+    in the cached NSE FNO instruments.
+    Fallback: Nifty spot × 2.06 (approximate ratio, rounded to nearest 100).
     """
     try:
-        from .config import SENSEX_SCRIP_CODE
-        url = f"{INDSTOCKS_BASE}/market/quotes/ltp?scrip-codes={SENSEX_SCRIP_CODE}"
-        res = requests.get(url, headers=get_auth_headers(), timeout=5)
-        if res.status_code == 200:
-            ltp = float(res.json().get('data', {}).get(SENSEX_SCRIP_CODE, {}).get('live_price', 0))
-            if ltp > 50000:
-                return ltp
+        df = _get_instruments()
+        if not df.empty:
+            today = pd.to_datetime(datetime.date.today())
+            bn_opts = df[
+                df['TRADING_SYMBOL'].str.upper().str.startswith('BANKNIFTY', na=False) &
+                (df['INSTRUMENT_NAME'] == 'OPTIDX') &
+                (df['EXPIRY_DATE'] >= today)
+            ].copy()
+
+            if not bn_opts.empty:
+                near_exp  = bn_opts['EXPIRY_DATE'].min()
+                near_opts = bn_opts[bn_opts['EXPIRY_DATE'] == near_exp]
+                candidates = sorted(near_opts[
+                    (near_opts['OPTION_TYPE'] == 'CE') &
+                    (near_opts['STRIKE_PRICE'] >= 44000) &
+                    (near_opts['STRIKE_PRICE'] <= 58000)
+                ]['STRIKE_PRICE'].unique())
+
+                for strike in candidates[::5]:  # sample every 5th
+                    row = near_opts[
+                        (near_opts['STRIKE_PRICE'] == strike) &
+                        (near_opts['OPTION_TYPE'] == 'CE')
+                    ]
+                    if row.empty:
+                        continue
+                    sec_id = f"NFO_{int(row.iloc[0]['SECURITY_ID'])}"
+                    ltp = _fetch_option_ltp_raw(sec_id)
+                    if 50 <= ltp <= 1500:   # ATM BankNifty premiums in this range
+                        return float(strike)
     except Exception as e:
-        log.warning(f"[SENSEX] Spot fetch error: {e}")
-    # Fallback: Sensex ≈ Nifty × 3.38 (approximate ratio, updated periodically)
+        log.warning(f"fetch_banknifty_spot error: {e}")
+
+    # Fallback: BankNifty ≈ Nifty × 2.06
     nifty = fetch_nifty_spot()
-    return round(nifty * 3.38 / 100) * 100
+    return round(nifty * 2.06 / 100) * 100
 
 
-def _fetch_bse_option_ltp(scrip_code: str) -> float:
-    """Fetches live BSE option LTP. scrip_code format: 'BFO_<SECURITY_ID>'"""
-    try:
-        url = f"{INDSTOCKS_BASE}/market/quotes/ltp?scrip-codes={scrip_code}"
-        res = requests.get(url, headers=get_auth_headers(), timeout=5)
-        if res.status_code == 200:
-            return float(res.json().get('data', {}).get(scrip_code, {}).get('live_price', 0))
-    except Exception as e:
-        log.warning(f"[SENSEX] LTP fetch error for {scrip_code}: {e}")
-    return 0.0
-
-
-def select_sensex_strike(direction: str, budget: float) -> dict:
+# ─────────────────────────────────────────────────────────────────────────────
+#  BANKNIFTY NSE OPTIONS  (fallback when Nifty delta-gate fires)
+#  BankNifty lot size = 15 units. ATM ~₹280-380 × 15 = ₹4,200-5,700 — fits ₹5K.
+#  2-3× more volatile than Nifty (400-600pt daily swings) — same signal, more ₹ gain.
+#  On expiry day (Wednesday), gamma is 3-5× higher: allows delta as low as 0.12.
+# ─────────────────────────────────────────────────────────────────────────────
+def select_banknifty_strike(direction: str, budget: float) -> dict:
     """
-    Finds a quality Sensex BSE option strike using the same logic as select_strike.
-    Sensex lot size = 10 units — very affordable ATM options for small budgets.
-    Returns dict with security_id (BFO_ prefix), strike, simulated_premium, exchange='BSE'.
+    Finds a quality BankNifty NSE option strike.
+    Uses same instruments cache as Nifty (both are NSE FNO, NFO_ prefix).
+    On expiry day (Wednesday), allows delta >= MIN_DELTA_ENTRY_EXPIRY near ATM
+    because gamma is 3-5× higher and a 100pt move gives 200-400%.
     Returns simulated_premium=0.0 if no quality strike found.
     """
     from .indicators import compute_greeks
-    from .config import SENSEX_LOT_SIZE, MIN_DELTA_ENTRY, MIN_PREMIUM_ENTRY
 
-    opt_type = "CE" if "LONG" in direction else "PE"
-    spot     = fetch_sensex_spot()
-    atm      = round(spot / 100) * 100   # Sensex strikes at 100-pt intervals
+    opt_type  = "CE" if "LONG" in direction else "PE"
+    spot      = fetch_banknifty_spot()
+    atm       = round(spot / 100) * 100   # BankNifty strikes at 100-pt intervals
+    on_expiry = _is_expiry_day('BANKNIFTY')
+    min_delta = MIN_DELTA_ENTRY_EXPIRY if on_expiry else MIN_DELTA_ENTRY
 
     _EMPTY = {"security_id": "", "strike": atm, "type": opt_type,
-               "days_to_expiry": 7, "simulated_premium": 0.0, "exchange": "BSE"}
+               "days_to_expiry": 7, "simulated_premium": 0.0, "index": "BANKNIFTY"}
 
     strikes = [atm + (i * 100) for i in range(-5, 6)]
-    log.info(f"[SENSEX] Searching {opt_type} strikes around ATM {atm} | Budget ₹{budget:.0f} | Lot {SENSEX_LOT_SIZE}")
+    log.info(
+        f"[BANKNIFTY] Searching {opt_type} strikes around ATM {atm} | "
+        f"Budget ₹{budget:.0f} | Lot {BANKNIFTY_LOT_SIZE} | "
+        f"{'⚡ EXPIRY — γ mode (δ≥' + str(min_delta) + ')' if on_expiry else 'Normal (δ≥' + str(min_delta) + ')'}"
+    )
 
-    df = _get_sensex_instruments()
+    df = _get_instruments()
     if df.empty:
-        log.warning("[SENSEX] No BSE instruments — Sensex fallback unavailable.")
+        log.warning("[BANKNIFTY] No NSE instruments — BankNifty fallback unavailable.")
         return _EMPTY
 
     today = pd.to_datetime(datetime.date.today())
-    sensex_opts = df[
-        df['TRADING_SYMBOL'].str.upper().str.contains('SENSEX', na=False) &
-        df['INSTRUMENT_NAME'].isin(['OPTIDX', 'IO']) &
+    bn_opts = df[
+        df['TRADING_SYMBOL'].str.upper().str.startswith('BANKNIFTY', na=False) &
+        (df['INSTRUMENT_NAME'] == 'OPTIDX') &
         (df['OPTION_TYPE'] == opt_type) &
         (df['EXPIRY_DATE'] >= today)
     ].copy()
 
-    if sensex_opts.empty:
-        log.warning("[SENSEX] No Sensex options in BSE instruments.")
+    if bn_opts.empty:
+        log.warning("[BANKNIFTY] No BankNifty options in NSE instruments.")
         return _EMPTY
 
-    near_expiry  = sensex_opts['EXPIRY_DATE'].min()
-    near_opts    = sensex_opts[sensex_opts['EXPIRY_DATE'] == near_expiry]
-    days_to_exp  = max(1, (near_expiry.date() - datetime.date.today()).days)
+    near_expiry = bn_opts['EXPIRY_DATE'].min()
+    near_opts   = bn_opts[bn_opts['EXPIRY_DATE'] == near_expiry]
+    days_to_exp = max(1, (near_expiry.date() - datetime.date.today()).days)
 
     candidates = []
     for strike in strikes:
         row = near_opts[near_opts['STRIKE_PRICE'] == float(strike)]
         if row.empty:
             continue
-        sec_id = f"BFO_{int(row.iloc[0]['SECURITY_ID'])}"
-        ltp    = _fetch_bse_option_ltp(sec_id)
+        sec_id = f"NFO_{int(row.iloc[0]['SECURITY_ID'])}"
+        ltp    = _fetch_option_ltp_raw(sec_id)
         if ltp <= 0:
             continue
-        greeks = compute_greeks(spot, strike, days_to_exp, ltp, opt_type)
-        cost   = ltp * SENSEX_LOT_SIZE
-        log.info(f"  [SENSEX] {strike} {opt_type}: ₹{ltp:.2f} | δ={greeks['delta']:.2f} | Cost ₹{cost:.0f}")
+        greeks    = compute_greeks(spot, strike, days_to_exp, ltp, opt_type)
+        cost      = ltp * BANKNIFTY_LOT_SIZE
+        near_atm  = abs(strike - atm) <= 200   # within 2 strikes = 200pts
+
+        log.info(
+            f"  [BN] {strike} {opt_type}: ₹{ltp:.2f} | δ={greeks['delta']:.2f} | "
+            f"Cost ₹{cost:.0f} | {'Near ATM' if near_atm else 'OTM'}"
+        )
         if cost <= budget:
-            candidates.append({'strike': strike, 'premium': ltp, 'sec_id': sec_id,
-                                'delta': greeks['delta'], 'days_to_exp': days_to_exp})
+            candidates.append({
+                'strike': strike, 'premium': ltp, 'sec_id': sec_id,
+                'delta': greeks['delta'], 'days_to_exp': days_to_exp,
+                'near_atm': near_atm
+            })
 
     best_choice = None
-    quality = [c for c in candidates if 0.40 <= c['delta'] <= 0.65]
-    if quality:
-        best_choice = max(quality, key=lambda x: x['delta'])
-    elif candidates:
-        best_choice = max(candidates, key=lambda x: x['delta'])
+
+    # On expiry day: prefer near-ATM gamma plays (even at lower delta)
+    if on_expiry:
+        gamma_cands = [c for c in candidates if c['near_atm'] and c['delta'] >= min_delta]
+        if gamma_cands:
+            best_choice = max(gamma_cands, key=lambda x: x['delta'])
+
+    # Normal selection: highest delta in quality range, else best available
+    if not best_choice:
+        quality = [c for c in candidates if 0.40 <= c['delta'] <= 0.65]
+        if quality:
+            best_choice = max(quality, key=lambda x: x['delta'])
+        elif candidates:
+            best_choice = max(candidates, key=lambda x: x['delta'])
 
     if not best_choice:
-        log.warning("[SENSEX] No affordable strikes found.")
+        log.warning("[BANKNIFTY] No affordable strikes found.")
         return _EMPTY
 
-    if best_choice['delta'] < MIN_DELTA_ENTRY:
-        log.warning(f"[SENSEX] Best delta {best_choice['delta']:.2f} < {MIN_DELTA_ENTRY} — skipping.")
+    if best_choice['delta'] < min_delta:
+        log.warning(
+            f"[BANKNIFTY] Best delta {best_choice['delta']:.2f} < {min_delta} "
+            f"({'expiry γ mode' if on_expiry else 'normal'}) — skipping."
+        )
         return _EMPTY
 
     if best_choice['premium'] < MIN_PREMIUM_ENTRY:
-        log.warning(f"[SENSEX] Premium ₹{best_choice['premium']:.2f} < ₹{MIN_PREMIUM_ENTRY} — skipping.")
+        log.warning(f"[BANKNIFTY] Premium ₹{best_choice['premium']:.2f} < ₹{MIN_PREMIUM_ENTRY} — skipping.")
         return _EMPTY
 
-    log.info(f"✅ [SENSEX] Quality Match: SENSEX {best_choice['strike']} {opt_type} "
-             f"@ ₹{best_choice['premium']:.2f} (δ={best_choice['delta']:.2f})")
+    gamma_tag = " 🎯 GAMMA PLAY" if (on_expiry and best_choice['near_atm']) else ""
+    log.info(
+        f"✅ [BANKNIFTY] {best_choice['strike']} {opt_type} "
+        f"@ ₹{best_choice['premium']:.2f} (δ={best_choice['delta']:.2f}){gamma_tag}"
+    )
     return {
         "security_id":       best_choice['sec_id'],
         "strike":            best_choice['strike'],
         "type":              opt_type,
         "days_to_expiry":    best_choice['days_to_exp'],
         "simulated_premium": best_choice['premium'],
-        "exchange":          "BSE",
+        "index":             "BANKNIFTY",
     }
 
 
