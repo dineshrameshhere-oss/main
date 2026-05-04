@@ -353,7 +353,7 @@ def execute_scalp_trade(rating_score: float, direction: str,
     if vol_mode:
         log.info(
             f"⚡ OTM VOL MODE | Score {rating_score:+.2f} ≥ {OTM_VOL_MIN_SCORE} ✓ | "
-            f"Max hold: {OTM_VOL_MAX_HOLD_MIN}min | Stagnation exit after 15min"
+            f"Max hold: {OTM_VOL_MAX_HOLD_MIN}min | Continuous theta-bleed exit active"
         )
 
     # Correct scaled spot for Greeks calculation.
@@ -413,10 +413,12 @@ def execute_scalp_trade(rating_score: float, direction: str,
     if not order:
         return
 
-    # Tag OTM vol mode onto the order so the monitor thread enforces speed rules
+    # Tag OTM vol mode onto the order so the monitor thread enforces speed rules.
+    # entry_theta (₹/day) lets the monitor compute per-tick decay without extra API calls.
     if vol_mode:
         order['otm_vol_mode'] = True
         order['max_hold_min'] = OTM_VOL_MAX_HOLD_MIN
+        order['entry_theta']  = float(greeks.get('theta', 0.0))
 
     # Monitor thread takes over
     with state.active_position_lock:

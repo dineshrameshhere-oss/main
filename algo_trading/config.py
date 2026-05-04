@@ -93,8 +93,17 @@ OTM_VOL_MIN_DELTA    = 0.15   # Hard floor even in vol mode (below this = lotter
 OTM_VOL_MIN_SCORE    = 0.85   # Max-conviction only — all signals must agree
 OTM_VOL_MAX_HOLD_MIN = 30     # 30-min max hold — theta acceleration kills OTM past this
 OTM_VOL_IV_MOVE_MULT = 1.5    # OTM distance must be ≤ IV-implied daily move × this
-OTM_STAGNATION_TICKS = 90     # 15 min at 10s/tick — start stagnation watch after this
-OTM_STAGNATION_PCT   = -0.08  # Exit if PnL < -8% with no improving trend (theta trap)
+
+# ── OTM Continuous Theta-Bleed Checks (run every tick, not after a fixed delay) ──
+# Check A — Momentum Stall: if premium drops >5% in any 60s window while underwater
+#   → underlying moving AGAINST us (delta loss >> theta). No point waiting. Exit now.
+# Check B — Recovery Impossible: if (current loss + remaining theta cost) > 25%
+#   AND momentum is flat/down → can't realistically recover to +20%. Exit.
+# Both checks start after tick 12 (2 min) to let the trade settle past bid-ask noise.
+OTM_MOMENTUM_WINDOW    = 6     # rolling window in ticks (6 × 10s = 60 seconds)
+OTM_MOMENTUM_STOP_PCT  = 0.05  # 5% drop in 60s = severe stall, underlying against us
+OTM_RECOVERY_MAX_PCT   = 0.25  # need 25%+ gain just to break even → mathematically dead
+OTM_THETA_CHECK_START  = 12    # start checks after tick 12 (2 min) — avoids open noise
 
 # LLM Config
 GEMINI_MODEL      = "gemini-2.0-flash"

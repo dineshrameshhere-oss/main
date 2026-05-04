@@ -3,7 +3,9 @@ from typing import Callable
 from .logger import log
 from .trade_executor import close_order
 from .config import (DEFAULT_SL_PCT, MAX_DAILY_LOSS_PCT, TRAILING_STEPS, BROKERAGE_PER_TRADE,
-                     MIN_PREMIUM_ENTRY, OTM_STAGNATION_TICKS, OTM_STAGNATION_PCT)
+                     MIN_PREMIUM_ENTRY,
+                     OTM_MOMENTUM_WINDOW, OTM_MOMENTUM_STOP_PCT,
+                     OTM_RECOVERY_MAX_PCT, OTM_THETA_CHECK_START)
 
 # Max retries when LTP fetch returns zero (API hiccup)
 _LTP_ZERO_MAX_RETRIES = 5
@@ -80,6 +82,10 @@ def monitor_position(order: dict, live: bool = False,
     # Vol-mode flags — OTM entries have faster exit rules to fight theta decay
     otm_vol_mode  = order.get('otm_vol_mode', False)
     max_hold_min  = int(order.get('max_hold_min', 60))
+    # entry_theta: ₹/day from compute_greeks. Converted to per-tick cost (10s ticks).
+    # 1 day = 8640 ticks at 10s. Negative by convention (decay), so we use abs().
+    raw_theta     = float(order.get('entry_theta', 0.0))
+    theta_per_tick = abs(raw_theta) / 8640 if raw_theta != 0 else 0.0
 
     # Tracking state
     peak_pnl_pct  = 0.0
@@ -95,6 +101,7 @@ def monitor_position(order: dict, live: bool = False,
     tick             = 0
     max_ticks        = max_hold_min * 6  # 6 ticks/min at 10s each
     tp_logged        = False
+    premium_history  = []   # rolling LTP window for momentum/theta checks
 
     log.info(
         f"Monitor START [{order_id}] | Entry ₹{entry:.2f} | "
@@ -102,7 +109,8 @@ def monitor_position(order: dict, live: bool = False,
         f"Initial TP ₹{initial_tp:.2f} | "
         f"Mode: {'LIVE' if live else 'PAPER'} | Poll: 10s | "
         f"Max hold: {max_hold_min} min"
-        + (" | ⚡ OTM VOL MODE — stagnation exit ON" if otm_vol_mode else "")
+        + (f" | ⚡ OTM VOL MODE — θ={raw_theta:.2f}₹/day | continuous bleed-exit ON"
+           if otm_vol_mode else "")
     )
     log.info(f"Stepped Trailing SL active — {len(TRAILING_STEPS)} rungs up to +200%")
 
@@ -124,6 +132,11 @@ def monitor_position(order: dict, live: bool = False,
                 return
             continue
         zero_ltp_retries = 0
+
+        # ── Rolling premium history (for momentum slope) ──────────────────────
+        premium_history.append(current_premium)
+        if len(premium_history) > OTM_MOMENTUM_WINDOW:
+            premium_history.pop(0)
 
         # ── P&L calculation ───────────────────────────────────────────────────
         pnl_pct    = (current_premium - entry) / entry
@@ -154,10 +167,18 @@ def monitor_position(order: dict, live: bool = False,
         # ── Progress log every 30s (every 3 ticks at 10s) — reduce noise ──────
         if tick % 3 == 0:
             arrow = "📈" if pnl_pct >= 0 else "📉"
+            theta_note = ""
+            if otm_vol_mode and theta_per_tick > 0:
+                ticks_left = max_ticks - tick
+                theta_burn_pct = (theta_per_tick * ticks_left) / entry * 100
+                recovery_needed = (-pnl_pct + theta_per_tick * ticks_left / entry) * 100
+                theta_note = (f" | θ-burn left {theta_burn_pct:.1f}% | "
+                              f"need {recovery_needed:.1f}% to b/e")
             log.info(
                 f"{arrow} [{order_id}] LTP ₹{current_premium:.2f} | "
                 f"PnL {pnl_pct*100:+.1f}% (₹{pnl_amount:+.0f}) | "
                 f"Peak {peak_pnl_pct*100:.1f}% | SL floor {current_sl_floor*100:+.1f}% (₹{effective_sl:.2f})"
+                + theta_note
             )
 
         # ── 1. INITIAL TP NOTIFICATION (let winner run past it) ──────────────
@@ -196,24 +217,49 @@ def monitor_position(order: dict, live: bool = False,
             if on_close: on_close(pnl_amount)
             return
 
-        # ── 4. OTM STAGNATION EXIT ────────────────────────────────────────────
-        # OTM options bleed from theta when the underlying does not move.
-        # After 15 minutes: if we're underwater AND the position is declining
-        # (not just a temporary dip) → cut the loss before theta eats more.
-        # Condition: pnl < -8% AND current pnl is 3% below peak (declining, not stable).
-        if (otm_vol_mode
-                and tick >= OTM_STAGNATION_TICKS
-                and pnl_pct < OTM_STAGNATION_PCT
-                and pnl_pct <= peak_pnl_pct - 0.03):
-            log.warning(
-                f"⏱️ OTM STAGNATION [{order_id}] | {tick * 10 // 60}min elapsed | "
-                f"PnL {pnl_pct*100:+.1f}% | Peak {peak_pnl_pct*100:+.1f}% | "
-                f"Theta bleeding with no recovery trend — cutting loss now."
+        # ── 4. OTM CONTINUOUS THETA-BLEED CHECKS ─────────────────────────────
+        # Run every tick from tick OTM_THETA_CHECK_START (2 min) onward.
+        # Two independent triggers — either alone is enough to exit.
+        if otm_vol_mode and tick >= OTM_THETA_CHECK_START and pnl_pct < 0:
+
+            # ── Check A: Momentum Stall ────────────────────────────────────
+            # If the full rolling window is filled and premium dropped >5% in
+            # the last 60s: underlying is actively moving AGAINST us.
+            # Delta loss >> theta loss. No recovery thesis. Exit now.
+            if len(premium_history) >= OTM_MOMENTUM_WINDOW:
+                window_drop = (current_premium - premium_history[0]) / premium_history[0]
+                if window_drop < -OTM_MOMENTUM_STOP_PCT:
+                    log.warning(
+                        f"⚡ OTM MOMENTUM STALL [{order_id}] | "
+                        f"60s drop {window_drop*100:.1f}% < -{OTM_MOMENTUM_STOP_PCT*100:.0f}% | "
+                        f"PnL {pnl_pct*100:+.1f}% | Underlying moving against — exit."
+                    )
+                    close_order(order_id, "OTM_MOMENTUM_STALL", pnl=pnl_amount,
+                                live=live, security_id=security_id, qty=qty)
+                    if on_close: on_close(pnl_amount)
+                    return
+
+            # ── Check B: Recovery Mathematically Impossible ────────────────
+            # Total hole = current loss + theta that will burn over remaining hold.
+            # If that exceeds 25% AND last 30s shows no recovery bounce → dead trade.
+            ticks_left           = max_ticks - tick
+            theta_remaining_pct  = (theta_per_tick * ticks_left) / entry
+            recovery_needed      = (-pnl_pct) + theta_remaining_pct
+            recent_flat_or_down  = (
+                len(premium_history) >= 3 and
+                (current_premium - premium_history[-3]) / premium_history[-3] <= 0.01
             )
-            close_order(order_id, "OTM_STAGNATION", pnl=pnl_amount, live=live,
-                        security_id=security_id, qty=qty)
-            if on_close: on_close(pnl_amount)
-            return
+            if recovery_needed > OTM_RECOVERY_MAX_PCT and recent_flat_or_down:
+                log.warning(
+                    f"⚡ OTM RECOVERY IMPOSSIBLE [{order_id}] | "
+                    f"Need {recovery_needed*100:.1f}% gain to b/e "
+                    f"(loss {-pnl_pct*100:.1f}% + θ-remaining {theta_remaining_pct*100:.1f}%) | "
+                    f"No momentum in last 30s — theta will only deepen the hole."
+                )
+                close_order(order_id, "OTM_RECOVERY_IMPOSSIBLE", pnl=pnl_amount,
+                            live=live, security_id=security_id, qty=qty)
+                if on_close: on_close(pnl_amount)
+                return
 
     # ── 5. MAX HOLD REACHED ────────────────────────────────────────────────────
     final_premium = _fetch_live_premium(security_id)
