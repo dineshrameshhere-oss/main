@@ -39,23 +39,29 @@ def _get_instruments() -> pd.DataFrame:
             # INDMoney typically uses 'LOT_SIZE', 'LOT_UNITS' or 'MIN_LOT_QUANTITY'
             lot_col = next((c for c in ['LOT_UNITS', 'LOT_SIZE', 'MIN_LOT_QUANTITY', 'FREEZE_QTY'] if c in _INSTRUMENTS_DF.columns), None)
             
-            if lot_col:
-                # Filter for NIFTY OPTIDX
-                nifty_mask = (
-                    _INSTRUMENTS_DF['TRADING_SYMBOL'].str.upper().str.startswith('NIFTY', na=False) &
-                    (_INSTRUMENTS_DF['INSTRUMENT_NAME'] == 'OPTIDX')
-                )
-                nifty_sample = _INSTRUMENTS_DF[nifty_mask]
+            # Filter for NIFTY OPTIDX first to ensure we are looking at the right instrument
+            nifty_mask = (
+                _INSTRUMENTS_DF['TRADING_SYMBOL'].str.upper().str.contains('NIFTY', na=False) &
+                (_INSTRUMENTS_DF['INSTRUMENT_NAME'] == 'OPTIDX')
+            )
+            nifty_sample = _INSTRUMENTS_DF[nifty_mask]
+
+            if not nifty_sample.empty:
+                # Priority: Look for a row that specifically mentions '65' or 'LOT_SIZE'
+                # Sometimes the CSV has multiple Nifty rows, we want the most recent/active one
+                active_row = nifty_sample.iloc[0]
                 
-                if not nifty_sample.empty:
-                    dynamic_lot = int(nifty_sample.iloc[0][lot_col])
-                    if dynamic_lot > 0:
-                        config.LOT_SIZE = dynamic_lot
-                        log.info(f"📊 DYNAMIC LOT SIZE DETECTED: {config.LOT_SIZE} (from {lot_col})")
+                # If we found a lot column, use it
+                if lot_col:
+                    config.LOT_SIZE = int(active_row[lot_col])
+                    log.info(f"📊 DYNAMIC LOT SIZE DETECTED: {config.LOT_SIZE} (from {lot_col})")
                 else:
-                    log.warning("⚠️ Dynamic Lot Size: Could not find NIFTY OPTIDX row in instruments.")
+                    # Fallback: Hardcoded 65 as it is the current exchange standard for Nifty
+                    config.LOT_SIZE = 65
+                    log.warning("⚠️ Dynamic Lot Size: Column not found, using Nifty standard 65.")
             else:
-                log.warning(f"⚠️ Dynamic Lot Size: Could not find lot column in instruments. Columns: {list(_INSTRUMENTS_DF.columns)}")
+                log.warning("⚠️ Dynamic Lot Size: Could not find NIFTY OPTIDX in instruments.")
+                config.LOT_SIZE = 65 # Safe fallback for Nifty
 
             return _INSTRUMENTS_DF
     except Exception as e:

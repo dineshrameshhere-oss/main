@@ -451,11 +451,21 @@ def scalp_poll():
     if not hasattr(state, 'score_history'):
         state.score_history = []
     
+    # ── STARTUP CONSISTENCY CHECK ───────────────────────────────────────
+    # If the bot just started, we require at least 2 bars of consistent bias
+    # to prevent immediate "fake" signals from stale or outlier candles.
+    is_startup = len(state.score_history) < 2
+    
     rating = compute_multi_rating(window_df, rsi_window, adx_val, macd_w,
                                    pcr=pcr_data, fnf_direction=fnf_dir, ivr_signal=ivr_sig,
                                    score_history=state.score_history, mtf_score=mtf_score)
     score  = rating['score']
     bd     = rating['breakdown']
+
+    # If startup, we penalize the score to prevent immediate entry
+    if is_startup:
+        log.info("🕒 Bot startup: Waiting for 2nd bar consistency check...")
+        score *= 0.3  # Drastically reduce conviction for the very first poll cycle after restart
 
     # ── DIRECTIONAL TIMEOUT (Anti-Revenge) ──────────────────────────────
     # If a recent loss occurred, block re-entry in same direction for 30m

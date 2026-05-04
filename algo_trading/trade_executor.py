@@ -44,6 +44,15 @@ def place_order(security_id: str, direction: str, qty: int,
     # FIX: The /order API expects raw numeric ID, but our internal logic uses 'NFO_' prefix.
     raw_security_id = security_id.replace('NFO_', '')
 
+    # ── QTY SAFETY CHECK ──────────────────────────────────────────────────
+    # NSE requires Nifty quantities to be multiples of 65.
+    if 'NIFTY' in security_id.upper() or int(raw_security_id) > 0:
+        if qty % 65 != 0:
+            old_qty = qty
+            qty = (qty // 65) * 65
+            if qty == 0: qty = 65
+            log.warning(f"⚠️ Qty Adjustment: {old_qty} → {qty} (must be multiple of 65 for Nifty)")
+
     # Use standard /order endpoint as per documentation for reliability
     payload = {
         'txn_type':         txn_type,
