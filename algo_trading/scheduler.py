@@ -454,7 +454,7 @@ def scalp_poll():
     # If a recent loss occurred, block re-entry in same direction for 30m
     now_ist = datetime.now(IST)
     is_blocked = False
-    if hasattr(state, 'last_loss_time') and hasattr(state, 'last_loss_dir'):
+    if state.last_loss_time and state.last_loss_dir:
         time_since_loss = (now_ist - state.last_loss_time).total_seconds() / 60
         if time_since_loss < 30:
             intended_dir = "CALL" if score >= 0.3 else ("PUT" if score <= -0.3 else "NONE")
