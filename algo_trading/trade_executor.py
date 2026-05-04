@@ -45,13 +45,15 @@ def place_order(security_id: str, direction: str, qty: int,
     raw_security_id = security_id.replace('NFO_', '')
 
     # ── QTY SAFETY CHECK ──────────────────────────────────────────────────
-    # NSE requires Nifty quantities to be multiples of 65.
+    # NSE requires Nifty quantities to be multiples of the current lot size.
+    from .config import LOT_SIZE as _lot
     if 'NIFTY' in security_id.upper() or int(raw_security_id) > 0:
-        if qty % 65 != 0:
+        if qty % _lot != 0:
             old_qty = qty
-            qty = (qty // 65) * 65
-            if qty == 0: qty = 65
-            log.warning(f"⚠️ Qty Adjustment: {old_qty} → {qty} (must be multiple of 65 for Nifty)")
+            qty = (qty // _lot) * _lot
+            if qty == 0: qty = _lot
+            log.warning(f"⚠️ Qty Adjustment: {old_qty} → {qty} (must be multiple of {_lot} for Nifty)")
+            order['qty'] = qty   # keep order dict in sync so monitor closes correct qty
 
     # Use standard /order endpoint as per documentation for reliability
     payload = {
@@ -126,6 +128,59 @@ def update_paper_balance(pnl: float):
 def _write_balance(balance: float):
     with open(PAPER_BALANCE_FILE, 'w') as f:
         json.dump({'balance': round(balance, 2)}, f)
+
+
+def get_open_positions(live: bool = False) -> list:
+    """
+    Fetches open derivative positions from the broker.
+    Returns a list of dicts with security_id, qty, product.
+    Returns empty list on paper mode or API failure.
+    """
+    if not live:
+        return []
+    import requests
+    from .market_data import get_auth_headers
+    from .config import INDSTOCKS_BASE
+    try:
+        url = f"{INDSTOCKS_BASE}/positions"
+        res = requests.get(url, headers=get_auth_headers(), timeout=5)
+        if res.status_code == 200:
+            data = res.json().get('data', [])
+            open_pos = []
+            for p in (data if isinstance(data, list) else []):
+                net_qty = int(p.get('net_qty', p.get('netQty', p.get('quantity', 0))))
+                if net_qty != 0 and p.get('segment', '').upper() in ('DERIVATIVE', 'FNO', 'NFO'):
+                    open_pos.append({
+                        'security_id': f"NFO_{p.get('security_id', p.get('securityId', ''))}",
+                        'qty':         abs(net_qty),
+                        'order_id':    p.get('order_id', p.get('orderId', 'BROKER')),
+                    })
+            return open_pos
+        log.warning(f"⚠️ Positions API {res.status_code}: {res.text[:80]}")
+    except Exception as e:
+        log.warning(f"⚠️ Could not fetch open positions: {e}")
+    return []
+
+
+def square_off_all_open_positions(live: bool = False):
+    """
+    Fetches all open derivative positions from broker and places MARKET SELL to close.
+    Called at startup to ensure no stale positions are left from a previous run.
+    """
+    if not live:
+        return
+    positions = get_open_positions(live=True)
+    if not positions:
+        log.info("✅ No open broker positions found.")
+        return
+    log.warning(f"⚠️ Found {len(positions)} open position(s) on broker — squaring off...")
+    for pos in positions:
+        close_order(
+            pos['order_id'], 'STARTUP_SQUAREOFF',
+            pnl=0.0, live=True,
+            security_id=pos['security_id'],
+            qty=pos['qty']
+        )
 
 
 def close_order(order_id: str, exit_reason: str, pnl: float = 0.0, live: bool = False,

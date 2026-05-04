@@ -2,7 +2,7 @@ import time
 from typing import Callable
 from .logger import log
 from .trade_executor import close_order
-from .config import DEFAULT_SL_PCT, MAX_DAILY_LOSS_PCT, TRAILING_STEPS, BROKERAGE_PER_TRADE
+from .config import DEFAULT_SL_PCT, MAX_DAILY_LOSS_PCT, TRAILING_STEPS, BROKERAGE_PER_TRADE, MIN_PREMIUM_ENTRY
 
 # Max retries when LTP fetch returns zero (API hiccup)
 _LTP_ZERO_MAX_RETRIES = 5
@@ -78,7 +78,14 @@ def monitor_position(order: dict, live: bool = False,
 
     # Tracking state
     peak_pnl_pct     = 0.0
-    current_sl_floor = -DEFAULT_SL_PCT   # starts as hard SL (negative = loss allowed)
+    # Use the order's computed sl_price as the initial hard floor.
+    # This respects wider SLs for cheaper options (e.g. -15% for ₹60 premium)
+    # so we don't get stopped by bid-ask spread noise.
+    # Fall back to DEFAULT_SL_PCT only if sl_price is missing or invalid.
+    if hard_sl > 0 and hard_sl < entry:
+        current_sl_floor = (hard_sl - entry) / entry   # e.g. -0.15 for 15% SL
+    else:
+        current_sl_floor = -DEFAULT_SL_PCT
     zero_ltp_retries = 0
     tick             = 0
     max_ticks        = 360               # 360 × 10s = 60 min max hold
@@ -86,7 +93,8 @@ def monitor_position(order: dict, live: bool = False,
 
     log.info(
         f"Monitor START [{order_id}] | Entry ₹{entry:.2f} | "
-        f"Hard SL ₹{hard_sl:.2f} | Initial TP ₹{initial_tp:.2f} | "
+        f"Hard SL ₹{hard_sl:.2f} ({current_sl_floor*100:.0f}%) | "
+        f"Initial TP ₹{initial_tp:.2f} | "
         f"Mode: {'LIVE' if live else 'PAPER'} | Poll: 10s | Max hold: 60 min"
     )
     log.info(f"Stepped Trailing SL active — {len(TRAILING_STEPS)} rungs up to +200%")
@@ -158,7 +166,7 @@ def monitor_position(order: dict, live: bool = False,
         # (effective_sl + 0.1% buffer) to avoid getting filled even lower.
         slippage_buffer = entry * 0.001  # 0.1% buffer
         if current_premium <= (effective_sl + slippage_buffer):
-            reason = "TRAILING_SL_STEP" if current_sl_floor > -DEFAULT_SL_PCT else "HARD_SL"
+            reason = "TRAILING_SL_STEP" if peak_pnl_pct >= TRAILING_STEPS[0][0] else "HARD_SL"
             log.warning(
                 f"🛑 {reason} [{order_id}] | Exit ₹{current_premium:.2f} "
                 f"| Target ₹{effective_sl:.2f} | Buffer ₹{slippage_buffer:.2f} "

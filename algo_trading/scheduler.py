@@ -23,7 +23,7 @@ from .indicators import (
 )
 from .llm_analyst import analyze_premarket, analyze_market_open
 from .options_engine import select_strike, calculate_qty, calculate_dynamic_risk, compute_pcr
-from .trade_executor import place_order, get_balance, close_order
+from .trade_executor import place_order, get_balance, close_order, square_off_all_open_positions
 from .risk_manager import monitor_position
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -331,6 +331,11 @@ def execute_scalp_trade(rating_score: float, direction: str,
         log.warning("⚠️ No valid live premium — skipping trade.")
         return
 
+    # select_strike internally corrects a scaled spot (<10000) to real Nifty level.
+    # Use the strike itself as best proxy for ATM spot when df is stale/scaled.
+    if spot < 10000:
+        spot = float(strike_info['strike'])
+
     # ── Greeks: score contribution (no hard gate) ──────────────────────────────
     opt_type    = 'CE' if direction == 'SCALP_LONG' else 'PE'
     days_to_exp = strike_info.get('days_to_expiry', 7)
@@ -557,6 +562,12 @@ def start_scheduler(live_mode: bool = False, use_ai: bool = False):
     state.use_ai = use_ai
     mode_str = '🔴 LIVE' if live_mode else '🟢 PAPER'
     ai_str = 'Enabled' if use_ai else 'Disabled'
+
+    # ── Startup broker position check ───────────────────────────────────
+    # Square off any stale open positions before starting fresh.
+    # Runs before resuming the monitor so we don't double-close.
+    if live_mode and not state.active_position:
+        square_off_all_open_positions(live=True)
 
     balance = get_balance(live_mode)
     log.info(f"\n{'='*52}")

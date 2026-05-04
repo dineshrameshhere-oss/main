@@ -28,21 +28,21 @@ INTRADAY_TSL_ACTIVATION    = 15.0        # Activate TSL at 15% profit
 INTRADAY_TSL_TRAIL         = 8.0         # Trail by 8%
 
 # Trading Constants
-LOT_SIZE          = 75                   # Fallback Nifty lot size (dynamically updated by options_engine)
+LOT_SIZE          = 65                   # Nifty lot size (confirmed by broker API: must be multiple of 65)
 
 # ── Position Scaling Tiers (Quality Premium Focus) ───────────────────────────
-# Each lot = 65 units. We prioritize QUALITY (ATM/Shallow OTM) over quantity.
-# High Delta (0.45+) premiums cost more (₹100–₹250), so we scale slower.
+# Each lot = 65 units. We prioritize QUALITY (delta ≥ 0.25) over quantity.
+# With ₹5K budget, 1 lot @ ₹70 = ₹4550 — the maximum affordable quality strike.
 #
 # Capital Tier     | Max Lots | Approx. Cost per Trade
 # -----------------|----------|----------------------------------
-# ₹5,000           | 1 lot    | ₹2,500 - ₹5,000 (Premium limit ₹76)
-# ₹15,000          | 2 lots   | ₹6,500 - ₹13,000
-# ₹30,000          | 3 lots   | ₹9,750 - ₹19,500
-# ₹60,000          | 4 lots   | ₹13,000 - ₹26,000
-# ₹1,20,000        | 5 lots   | ₹19,500 - ₹39,000
+# ₹5,000           | 1 lot    | ₹2,600 - ₹5,000 (Premium ₹40–₹76)
+# ₹15,000          | 2 lots   | ₹5,200 - ₹9,750
+# ₹30,000          | 3 lots   | ₹7,800 - ₹14,625
+# ₹60,000          | 4 lots   | ₹10,400 - ₹19,500
+# ₹1,20,000        | 5 lots   | ₹13,000 - ₹24,375
 #
-# NOTE: Only scale up on STRONG_BUY signals (score >= 0.85).
+# NOTE: Only scale up on STRONG signals (score >= 0.85).
 LOT_SCALE_TIERS = [
     (5_000,   1),   # ₹5K  → 1 lot (65 units)
     (15_000,  2),   # ₹15K → 2 lots
@@ -50,6 +50,11 @@ LOT_SCALE_TIERS = [
     (60_000,  4),   # ₹60K → 4 lots
     (120_000, 5),   # ₹120K → 5 lots
 ]
+
+# ── Entry Quality Gates ────────────────────────────────────────────────────────
+# Hard stops before placing any trade. Better to miss a trade than take a bad one.
+MIN_DELTA_ENTRY   = 0.25   # Minimum delta: below this, option barely moves per Nifty point
+MIN_PREMIUM_ENTRY = 40.0   # Minimum premium ₹: below this, bid-ask spread eats SL instantly
 
 # LLM Config
 GEMINI_MODEL      = "gemini-2.0-flash"
@@ -90,26 +95,31 @@ SWING_ADX_MIN        = 20
 SWING_RSI_BULL_MIN   = 50
 SWING_RSI_BEAR_MAX   = 50
 
-# Risk Defaults (OTM HIGH-PROFIT Scalping)
-DEFAULT_SL_PCT      = 0.05              # Tight SL: 5% (cut losses fast on OTM)
-DEFAULT_TP_PCT      = 0.25             # 25% TP (realistic for OTM, +₹25-30 per ₹100 premium)
-MAX_DAILY_LOSS_PCT  = 0.20              # Circuit: stop if down 20% (loose for catching big moves)
+# Risk Defaults
+# DEFAULT_SL_PCT is used by risk_manager as initial hard-SL floor ONLY when the
+# order dict does not provide a valid sl_price. Normally sl_price from
+# calculate_dynamic_risk (wider, premium-calibrated) is used instead.
+DEFAULT_SL_PCT      = 0.15             # 15% fallback floor (wide enough to survive spread noise)
+DEFAULT_TP_PCT      = 0.60             # 60% initial TP notification (let trailing SL run past it)
+MAX_DAILY_LOSS_PCT  = 0.20             # Circuit: stop if down 20% of entry value
 
-# ── Multi-Indicator Rating Thresholds (OTM STRICT) ────────────────────────────────────────
-RATING_STRONG_BUY   = 0.55   # Raised: STRONG_BUY only (skip marginal signals)
-RATING_BUY          = 0.40   # Raised: fewer entries, higher quality
-RATING_STRONG_SELL  = -0.55  # Raised: STRONG_SELL only
-RATING_SELL         = -0.40  # Raised: higher threshold
-VOLUME_MULT_SURGE   = 2.5    # Raised: Volume surge 150%+ (high conviction)
-ADX_TREND_MIN       = 22     # Raised: Skip if too choppy
-ADX_TREND_STRONG    = 28     # Raised: Only strongest trends
+# ── Multi-Indicator Rating Thresholds ────────────────────────────────────────
+# Raised significantly. Target: 2-3 high-quality trades per week, not 3/day noise.
+RATING_STRONG_BUY        = 0.70   # High conviction only — skips marginal/false signals
+RATING_BUY               = 0.45
+RATING_STRONG_SELL       = -0.70
+RATING_SELL              = -0.45
+RATING_AFTERNOON_RELAXED = 0.60   # Still requires quality even with 0 trades (was 0.40)
+VOLUME_MULT_SURGE        = 2.5    # Volume surge 150%+
+ADX_TREND_MIN            = 25     # Skip if trending too weakly (was 22)
+ADX_TREND_STRONG         = 32     # Only strongest trends warrant entry (was 28)
 
 # ── Realized Volatility Gate ──────────────────────────────────────────────────
 # Skip all entries on flat days — if Nifty hasn't moved enough, premiums won't.
 # Measured as High-Low range of last 12 bars (1 hour of 5m candles).
-# Using % of current price so it works regardless of data scale (1107 or 24000).
-# 0.3% of 24000 = 72 pts. 0.3% of 1107 = 3.3 pts. Both meaningful.
-MIN_NIFTY_HOURLY_RANGE_PCT = 0.003   # 0.3% of current price
+# 0.5% of 24000 = 120 pts. A genuine trending move needs at least this range.
+# Flat days (range < 120pts) produce choppy options — nothing moves 10-200%.
+MIN_NIFTY_HOURLY_RANGE_PCT = 0.005   # 0.5% of current price (raised from 0.3%)
 
 # ── PCR (Put-Call Ratio) Directional Gate ─────────────────────────────────────
 # Applied only after 11:00 AM (OI not meaningful before that).
@@ -132,22 +142,19 @@ CANDLE_REJECTION_WICK = 2.0    # wick-to-body ratio above which = rejection cand
 MOMENTUM_BARS       = 6     # look-back bars (6 × 5min = 30 min)
 MOMENTUM_MIN_MOVE_PCT = 0.0005  # 0.05% net move in signal direction over 30 min
 
-# ── Stepped Trailing SL Ladder (OTM SCALP) ────────────────────────────────────────────────
-# Aggressive step-ups for momentum spikes (faster ratcheting than ATM)
-# Each tuple: (profit_trigger_pct, locked_sl_floor_pct)
-# SL only moves UP — never down.
+# ── Stepped Trailing SL Ladder ────────────────────────────────────────────────
+# Let winners run. First rung at +20% gives breathing room against noise.
+# Each tuple: (profit_trigger_pct, locked_sl_floor_pct). SL only moves UP.
 TRAILING_STEPS = [
-    (0.10, 0.05),   # +10% profit → lock in +5%   (first momentum rung)
-    (0.15, 0.08),   # +15% profit → lock in +8%
-    (0.20, 0.12),   # +20% profit → lock in +12%  (PRIMARY TP ZONE — likely hit)
-    (0.25, 0.15),   # +25% profit → lock in +15%  (TARGET HIT — secure win)
-    (0.30, 0.18),   # +30% profit → lock in +18%
-    (0.40, 0.25),   # +40% profit → lock in +25%
-    (0.50, 0.32),   # +50% profit → lock in +32%
-    (0.75, 0.45),   # +75% profit → lock in +45%
-    (1.00, 0.60),   # +100% profit → lock in +60%
-    (1.50, 0.80),   # +150% profit → lock in +80%
-    (2.00, 1.00),   # +200% profit → lock in +100%
+    (0.20, 0.08),   # +20% → lock +8%   (first lock — now definitely profitable)
+    (0.30, 0.15),   # +30% → lock +15%
+    (0.40, 0.22),   # +40% → lock +22%
+    (0.50, 0.30),   # +50% → lock +30%  (solid win locked)
+    (0.75, 0.45),   # +75% → lock +45%
+    (1.00, 0.60),   # +100% → lock +60% (doubled money, can't lose now)
+    (1.50, 0.80),   # +150% → lock +80%
+    (2.00, 1.00),   # +200% → lock +100% (tripled money)
+    (3.00, 1.50),   # +300% → lock +150% (extreme momentum day)
 ]
 
 # Brokerage + API cost per round-trip (buy + sell)
