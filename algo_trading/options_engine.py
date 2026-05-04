@@ -36,8 +36,8 @@ def _get_instruments() -> pd.DataFrame:
             log.debug(f"Instrument columns: {list(_INSTRUMENTS_DF.columns)}")
 
             # Check for LOT_SIZE column
-            # INDMoney typically uses 'LOT_SIZE' or 'MIN_LOT_QUANTITY'
-            lot_col = next((c for c in ['LOT_SIZE', 'MIN_LOT_QUANTITY', 'FREEZE_QTY'] if c in _INSTRUMENTS_DF.columns), None)
+            # INDMoney typically uses 'LOT_SIZE', 'LOT_UNITS' or 'MIN_LOT_QUANTITY'
+            lot_col = next((c for c in ['LOT_UNITS', 'LOT_SIZE', 'MIN_LOT_QUANTITY', 'FREEZE_QTY'] if c in _INSTRUMENTS_DF.columns), None)
             
             if lot_col:
                 # Filter for NIFTY OPTIDX
