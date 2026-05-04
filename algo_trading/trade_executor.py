@@ -41,6 +41,9 @@ def place_order(security_id: str, direction: str, qty: int,
     from .market_data import get_auth_headers
     from .config import INDSTOCKS_BASE, ALGO_ID
 
+    # FIX: The /order API expects raw numeric ID, but our internal logic uses 'NFO_' prefix.
+    raw_security_id = security_id.replace('NFO_', '')
+
     # Use standard /order endpoint as per documentation for reliability
     payload = {
         'txn_type':         txn_type,
@@ -49,10 +52,10 @@ def place_order(security_id: str, direction: str, qty: int,
         'product':          'MARGIN',
         'order_type':       'LIMIT',
         'validity':         'DAY',
-        'security_id':      security_id,
-        'qty':              qty,
-        'limit_price':      limit_price,
-        'algo_id':          ALGO_ID,
+        'security_id':      raw_security_id,
+        'qty':              int(qty),
+        'limit_price':      round(float(limit_price), 2),
+        'algo_id':          str(ALGO_ID),
         'is_amo':           False
     }
     try:
