@@ -63,7 +63,7 @@ def monitor_position(order: dict, live: bool = False,
     order_id    = order['order_id']
     security_id = order.get('security_id', '')
     entry       = float(order['entry_price'])    # option premium at entry
-    qty         = int(order.get('qty', 25))
+    qty         = int(order.get('qty') or 25)
     hard_sl     = float(order['sl_price'])
     initial_tp  = float(order['tp_price'])
 
@@ -81,13 +81,13 @@ def monitor_position(order: dict, live: bool = False,
     current_sl_floor = -DEFAULT_SL_PCT   # starts as hard SL (negative = loss allowed)
     zero_ltp_retries = 0
     tick             = 0
-    max_ticks        = 180               # 180 × 10s = 30 min max hold
+    max_ticks        = 360               # 360 × 10s = 60 min max hold
     tp_logged        = False
 
     log.info(
         f"Monitor START [{order_id}] | Entry ₹{entry:.2f} | "
         f"Hard SL ₹{hard_sl:.2f} | Initial TP ₹{initial_tp:.2f} | "
-        f"Mode: {'LIVE' if live else 'PAPER'} | Poll: 10s | Max hold: 30 min"
+        f"Mode: {'LIVE' if live else 'PAPER'} | Poll: 10s | Max hold: 60 min"
     )
     log.info(f"Stepped Trailing SL active — {len(TRAILING_STEPS)} rungs up to +200%")
 
