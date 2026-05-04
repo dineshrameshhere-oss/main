@@ -305,10 +305,10 @@ def check_rv_gate(df: pd.DataFrame) -> dict:
 
 
 def _rsi_signal(rsi: float) -> float:
-    if 55 <= rsi <= 75:  return +1.0   # bullish momentum
-    if 25 <= rsi <= 45:  return -1.0   # bearish momentum
-    if rsi > 80:         return -0.5   # overbought — fade
-    if rsi < 20:         return +0.5   # oversold — bounce
+    if 60 <= rsi <= 80:  return +1.0   # bullish momentum
+    if 20 <= rsi <= 40:  return -1.0   # bearish momentum
+    if rsi > 85:         return -0.5   # overbought — fade
+    if rsi < 15:         return +0.5   # oversold — bounce
     return 0.0
 
 def _stoch_rsi_signal(rsi_series: pd.Series, period: int = 14) -> float:
@@ -525,6 +525,15 @@ def compute_multi_rating(
         #  0.00: IVR 25-75 or API unavailable             → no effect
         score = score + float(ivr_signal)
 
+        # ── RSI DIRECTIONAL FILTER (Tightened) ─────────────────────────────
+        # If we are BUYING (Long), RSI must be above 50 (bullish zone).
+        # If we are SELLING (Short), RSI must be below 50 (bearish zone).
+        # This prevents entering a PE during a small dip in an uptrend.
+        if score > 0 and rsi_val < 50:
+            score *= 0.5  # Penalize bullish score if RSI < 50
+        elif score < 0 and rsi_val > 50:
+            score *= 0.5  # Penalize bearish score if RSI > 50
+
         # ── TREND CONSISTENCY (Cooldown / Anti-Whipsaw) ──────────────────────
         # Check if we are reversing direction too fast.
         # If we had a STRONG SELL in the last 15 mins and now have a STRONG BUY,
@@ -613,12 +622,16 @@ def compute_greeks(spot: float, strike: float, days_to_expiry: int,
     Returns delta (abs), gamma, theta (daily decay ₹/unit), vega, iv_pct.
     """
     try:
-        # Safety check: if spot is wrong (e.g. scaled price ~1100 instead of ~24000)
-        # we try to infer if we need to scale up or down.
-        # However, it's better to just ensure spot is the correct Nifty level.
+        # ── DYNAMIC SPOT HANDLING ───────────────────────────────────────────
+        # NSE_3045 returns ~1107 (scaled). Real Nifty is ~24000.
+        # If spot is scaled, we must un-scale it for Black-Scholes.
+        # Ratio is approx 24000 / 1107 ≈ 21.68
         if spot < 5000:
-             # Likely scaled/fake spot. Fallback to a neutral delta.
-             return {'delta': 0.45, 'gamma': 0.001, 'theta': -5.0, 'vega': 1.0, 'iv_pct': 20.0}
+             # Inferred scale: if spot=1107 and strike=24100, ratio=21.77
+             # We use the strike price as the anchor since it's always real.
+             scale_factor = strike / spot
+             log.debug(f"Greeks: Scaling spot {spot} by {scale_factor:.2f} to match strike {strike}")
+             spot = spot * scale_factor
 
         T = max(days_to_expiry, 0.5) / 365.0   # min 12hr to avoid div/0
 

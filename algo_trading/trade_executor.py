@@ -119,11 +119,14 @@ def _write_balance(balance: float):
         json.dump({'balance': round(balance, 2)}, f)
 
 
-def close_order(order_id: str, exit_reason: str, pnl: float = 0.0, live: bool = False) -> bool:
+def close_order(order_id: str, exit_reason: str, pnl: float = 0.0, live: bool = False,
+                security_id: str = None, qty: int = 0) -> bool:
     """
     Closes a position and records PnL.
     Paper mode: updates wallet file.
-    Live mode: cancels via INDMoney smart order cancel API.
+    Live mode: 
+      - If position is open (security_id provided), places a SELL order to square off.
+      - Otherwise, attempts to cancel the original order.
     """
     if not live:
         log.info(f"🏁 [PAPER TRADE] Position {order_id} closed | Reason: {exit_reason} | PnL: ₹{pnl:+.2f}")
@@ -133,8 +136,36 @@ def close_order(order_id: str, exit_reason: str, pnl: float = 0.0, live: bool = 
     log.info(f"🏁 [LIVE TRADE] Closing {order_id} | Reason: {exit_reason}")
     import requests
     from .market_data import get_auth_headers
-    from .config import INDSTOCKS_BASE
+    from .config import INDSTOCKS_BASE, ALGO_ID
 
+    # ── CASE 1: SQUARE OFF ACTIVE POSITION ──────────────────────────────────
+    # If we have a security_id and qty, it means the order was filled.
+    # We must place a SELL order to close it.
+    if security_id and qty > 0:
+        raw_security_id = security_id.replace('NFO_', '')
+        payload = {
+            'txn_type':         'SELL',
+            'exchange':         'NSE',
+            'segment':          'DERIVATIVE',
+            'product':          'MARGIN',
+            'order_type':       'MARKET',   # Use MARKET for fast exit on SL/TP
+            'validity':         'DAY',
+            'security_id':      raw_security_id,
+            'qty':              int(qty),
+            'algo_id':          str(ALGO_ID),
+            'is_amo':           False
+        }
+        try:
+            url = f"{INDSTOCKS_BASE}/order"
+            res = requests.post(url, json=payload, headers=get_auth_headers(), timeout=5)
+            if res.status_code == 200:
+                log.info(f"✅ [LIVE TRADE] Square-off SELL order placed for {order_id}.")
+                return True
+            log.error(f"❌ [LIVE TRADE] Square-off Failed: {res.status_code} {res.text[:120]}")
+        except Exception as e:
+            log.error(f"❌ [LIVE TRADE] Square-off API Error: {e}")
+
+    # ── CASE 2: CANCEL PENDING ORDER ────────────────────────────────────────
     try:
         # Using standard /order/cancel endpoint as per official documentation
         url = f"{INDSTOCKS_BASE}/order/cancel"

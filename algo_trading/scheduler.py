@@ -253,7 +253,8 @@ def job_eod():
     with state.active_position_lock:
         pos = state.active_position
         if pos and pos.get('status') == 'OPEN':
-            close_order(pos['order_id'], 'EOD_EXIT', pnl=0.0, live=state.live_mode)
+            close_order(pos['order_id'], 'EOD_EXIT', pnl=0.0, live=state.live_mode,
+                        security_id=pos.get('security_id'), qty=pos.get('qty', 0))
             state.active_position = None
     state.daily_trades = 0
     state.last_rating_score = 0.0

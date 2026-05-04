@@ -103,7 +103,8 @@ def monitor_position(order: dict, live: bool = False,
             log.warning(f"[{order_id}] Zero LTP (retry {zero_ltp_retries}/{_LTP_ZERO_MAX_RETRIES}) | {security_id}")
             if zero_ltp_retries >= _LTP_ZERO_MAX_RETRIES:
                 log.error(f"[{order_id}] LTP unavailable after {_LTP_ZERO_MAX_RETRIES} retries — force-closing.")
-                close_order(order_id, "LTP_UNAVAILABLE", pnl=0.0, live=live)
+                close_order(order_id, "LTP_UNAVAILABLE", pnl=0.0, live=live, 
+                            security_id=security_id, qty=qty)
                 if on_close: on_close(0.0)
                 return
             continue
@@ -153,13 +154,18 @@ def monitor_position(order: dict, live: bool = False,
             )
 
         # ── 2. SL HIT (hard SL or trailing floor) ────────────────────────────
-        if current_premium <= effective_sl:
+        # Slippage Buffer: Market moves fast. We exit if LTP is AT or BELOW 
+        # (effective_sl + 0.1% buffer) to avoid getting filled even lower.
+        slippage_buffer = entry * 0.001  # 0.1% buffer
+        if current_premium <= (effective_sl + slippage_buffer):
             reason = "TRAILING_SL_STEP" if current_sl_floor > -DEFAULT_SL_PCT else "HARD_SL"
             log.warning(
                 f"🛑 {reason} [{order_id}] | Exit ₹{current_premium:.2f} "
+                f"| Target ₹{effective_sl:.2f} | Buffer ₹{slippage_buffer:.2f} "
                 f"| Locked {current_sl_floor*100:+.0f}% | PnL ₹{pnl_amount:+.0f}"
             )
-            close_order(order_id, reason, pnl=pnl_amount, live=live)
+            close_order(order_id, reason, pnl=pnl_amount, live=live, 
+                        security_id=security_id, qty=qty)
             if on_close: on_close(pnl_amount)
             return
 
@@ -170,7 +176,8 @@ def monitor_position(order: dict, live: bool = False,
                 f"🚨 DAILY LOSS LIMIT [{order_id}] | Loss ₹{abs(pnl_amount):.0f} "
                 f"exceeds {MAX_DAILY_LOSS_PCT*100:.0f}% circuit breaker."
             )
-            close_order(order_id, "DAILY_LOSS_LIMIT", pnl=pnl_amount, live=live)
+            close_order(order_id, "DAILY_LOSS_LIMIT", pnl=pnl_amount, live=live, 
+                        security_id=security_id, qty=qty)
             if on_close: on_close(pnl_amount)
             return
 
@@ -183,5 +190,6 @@ def monitor_position(order: dict, live: bool = False,
         f"⏰ TIME LIMIT [{order_id}] | 60 min elapsed | "
         f"Exit ₹{final_premium:.2f} | PnL ₹{final_pnl:+.0f}"
     )
-    close_order(order_id, "TIME_LIMIT_EXIT", pnl=final_pnl, live=live)
+    close_order(order_id, "TIME_LIMIT_EXIT", pnl=final_pnl, live=live, 
+                security_id=security_id, qty=qty)
     if on_close: on_close(final_pnl)
