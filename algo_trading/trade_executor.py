@@ -138,7 +138,8 @@ def _write_balance(balance: float):
 def get_open_positions(live: bool = False) -> list:
     """
     Fetches open derivative positions from the broker.
-    Returns a list of dicts with security_id, qty, product.
+    Uses /portfolio/positions?segment=derivative endpoint per INDMoney API docs.
+    Returns a list of dicts with security_id, qty, order_id.
     Returns empty list on paper mode or API failure.
     """
     if not live:
@@ -147,18 +148,23 @@ def get_open_positions(live: bool = False) -> list:
     from .market_data import get_auth_headers
     from .config import INDSTOCKS_BASE
     try:
-        url = f"{INDSTOCKS_BASE}/positions"
+        url = f"{INDSTOCKS_BASE}/portfolio/positions?segment=derivative"
         res = requests.get(url, headers=get_auth_headers(), timeout=5)
         if res.status_code == 200:
-            data = res.json().get('data', [])
+            data = res.json().get('data', {})
+            net_positions = data.get('net_positions', [])
             open_pos = []
-            for p in (data if isinstance(data, list) else []):
-                net_qty = int(p.get('net_qty', p.get('netQty', p.get('quantity', 0))))
-                if net_qty != 0 and p.get('segment', '').upper() in ('DERIVATIVE', 'FNO', 'NFO'):
+            for p in net_positions:
+                net_qty = int(p.get('net_quantity', p.get('netQuantity', 0)))
+                if net_qty != 0:
+                    # security_id may need NFO_ or BFO_ prefix depending on exchange
+                    sec_id = p.get('security_id', '')
+                    if sec_id and not sec_id.startswith('NFO_') and not sec_id.startswith('BFO_'):
+                        sec_id = f"NFO_{sec_id}"
                     open_pos.append({
-                        'security_id': f"NFO_{p.get('security_id', p.get('securityId', ''))}",
+                        'security_id': sec_id,
                         'qty':         abs(net_qty),
-                        'order_id':    p.get('order_id', p.get('orderId', 'BROKER')),
+                        'order_id':    p.get('trading_symbol', 'BROKER'),
                     })
             return open_pos
         log.warning(f"⚠️ Positions API {res.status_code}: {res.text[:80]}")
