@@ -14,6 +14,10 @@ def print_banner(live_mode: bool = False, is_intraday: bool = False, use_ai: boo
     bot_type = 'DEEP LEARNING INTRADAY' if is_intraday else 'OPTIONS SCALPING'
     ai_status = 'Enabled' if use_ai else 'Disabled'
     
+    # ── Auspicious Start ──────────────────────────────────────────────────
+    print('\n  ௳')
+    print('  ஓம் நம சிவாய')
+    
     print('\033[96m' + '='*52)
     print(f'  🚀 NIFTY 50 {bot_type} BOT')
     print('='*52 + '\033[0m')
