@@ -281,9 +281,8 @@ def _on_position_closed(pnl: float = 0.0):
                 state.last_loss_dir  = "CALL" if "CE" in pos.get('security_id', '') else "PUT"
         else:
             state.consecutive_losses = 0
-            # Reset loss tracking on profit
-            if hasattr(state, 'last_loss_time'): del state.last_loss_time
-            if hasattr(state, 'last_loss_dir'):  del state.last_loss_dir
+            state.last_loss_time = None
+            state.last_loss_dir  = None
 
         state.active_position = None
         state.save_state()  # Persist immediately on trade close
@@ -411,7 +410,7 @@ def scalp_poll():
 
     if now_hm < OPEN or now_hm > CLOSE:
         return
-    if NOON_S <= now_hm <= NOON_E:
+    if NOON_S <= now_hm < NOON_E:
         return
 
     # ── Already in a trade? ─────────────────────────────────────────────
@@ -518,8 +517,8 @@ def scalp_poll():
         log.debug(f"Morning Volatility Buffer: threshold raised to {_strong_thresh}")
 
     if (state.daily_trades == 0
-            and now.hour > AFTERNOON_HOUR
-            or (now.hour == AFTERNOON_HOUR and now.minute >= AFTERNOON_MIN)):
+            and (now.hour > AFTERNOON_HOUR
+                 or (now.hour == AFTERNOON_HOUR and now.minute >= AFTERNOON_MIN))):
         _strong_thresh = RATING_AFTERNOON_RELAXED
         log.debug(f"Afternoon relaxed threshold: {_strong_thresh} (0 trades today)")
 
@@ -575,13 +574,7 @@ def start_scheduler(live_mode: bool = False, use_ai: bool = False):
         from .risk_manager import monitor_position
         threading.Thread(
             target=monitor_position,
-            args=(state.active_position['order_id'], 
-                  state.active_position['security_id'],
-                  state.active_position['entry_price'],
-                  state.active_position['sl_price'],
-                  state.active_position['tp_price'],
-                  live_mode,
-                  _on_position_closed),
+            args=(state.active_position, live_mode, _on_position_closed),
             daemon=True
         ).start()
 

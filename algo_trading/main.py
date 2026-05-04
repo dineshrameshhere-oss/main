@@ -89,9 +89,9 @@ def main():
         
     if is_intraday:
         from algo_trading.intraday_scheduler import start_intraday_scheduler
-        start_intraday_scheduler(live_mode)
+        start_intraday_scheduler(live_mode, use_ai=use_ai)
     else:
-        start_scheduler(live_mode)
+        start_scheduler(live_mode, use_ai=use_ai)
 
 
 if __name__ == '__main__':
