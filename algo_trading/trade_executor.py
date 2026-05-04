@@ -39,26 +39,31 @@ def place_order(security_id: str, direction: str, qty: int,
     # ── LIVE TRADING ──────────────────────────────────────────────────────
     import requests
     from .market_data import get_auth_headers
-    from .config import INDSTOCKS_BASE, ALGO_ID
+    from .config import INDSTOCKS_BASE, ALGO_ID, LOT_SIZE, SENSEX_LOT_SIZE
 
-    # FIX: The /order API expects raw numeric ID, but our internal logic uses 'NFO_' prefix.
-    raw_security_id = security_id.replace('NFO_', '')
+    # Detect exchange and strip internal prefix from security_id.
+    # NFO_XXXXX → NSE derivatives (Nifty options)
+    # BFO_XXXXX → BSE derivatives (Sensex options)
+    if security_id.startswith('BFO_'):
+        exchange        = 'BSE'
+        raw_security_id = security_id.replace('BFO_', '')
+        _lot            = SENSEX_LOT_SIZE
+    else:
+        exchange        = 'NSE'
+        raw_security_id = security_id.replace('NFO_', '')
+        _lot            = LOT_SIZE
 
     # ── QTY SAFETY CHECK ──────────────────────────────────────────────────
-    # NSE requires Nifty quantities to be multiples of the current lot size.
-    from .config import LOT_SIZE as _lot
-    if 'NIFTY' in security_id.upper() or int(raw_security_id) > 0:
-        if qty % _lot != 0:
-            old_qty = qty
-            qty = (qty // _lot) * _lot
-            if qty == 0: qty = _lot
-            log.warning(f"⚠️ Qty Adjustment: {old_qty} → {qty} (must be multiple of {_lot} for Nifty)")
-            order['qty'] = qty   # keep order dict in sync so monitor closes correct qty
+    if qty % _lot != 0:
+        old_qty = qty
+        qty = (qty // _lot) * _lot
+        if qty == 0: qty = _lot
+        log.warning(f"⚠️ Qty Adjustment: {old_qty} → {qty} (must be multiple of {_lot} for {exchange})")
+        order['qty'] = qty   # keep order dict in sync so monitor closes correct qty
 
-    # Use standard /order endpoint as per documentation for reliability
     payload = {
         'txn_type':         txn_type,
-        'exchange':         'NSE',
+        'exchange':         exchange,
         'segment':          'DERIVATIVE',
         'product':          'MARGIN',
         'order_type':       'LIMIT',
@@ -203,13 +208,12 @@ def close_order(order_id: str, exit_reason: str, pnl: float = 0.0, live: bool = 
     from .config import INDSTOCKS_BASE, ALGO_ID
 
     # ── CASE 1: SQUARE OFF ACTIVE POSITION ──────────────────────────────────
-    # If we have a security_id and qty, it means the order was filled.
-    # We must place a SELL order to close it.
     if security_id and qty > 0:
-        raw_security_id = security_id.replace('NFO_', '')
+        exchange        = 'BSE' if security_id.startswith('BFO_') else 'NSE'
+        raw_security_id = security_id.replace('BFO_', '').replace('NFO_', '')
         payload = {
             'txn_type':         'SELL',
-            'exchange':         'NSE',
+            'exchange':         exchange,
             'segment':          'DERIVATIVE',
             'product':          'MARGIN',
             'order_type':       'MARKET',   # Use MARKET for fast exit on SL/TP

@@ -13,6 +13,13 @@ NIFTY_EXCHANGE    = "NSE"
 PRODUCT_TYPE      = "MARGIN"
 ALGO_ID           = "99999"
 
+# ── Sensex BSE Options (fallback when Nifty delta-gate blocks entry) ──────────
+# BSE Sensex lot size = 10 units — ATM option ~₹300 × 10 = ₹3K, fits ₹5K budget
+# Strikes in 100-point intervals. Weekly Friday expiry on BSE.
+SENSEX_LOT_SIZE  = 10
+SENSEX_EXCHANGE  = 'BSE'
+SENSEX_SCRIP_CODE = 'BSE_1'    # BSE Sensex index scrip code
+
 # ── Scalping Bot Safety Net ───────────────────────────────────────────────────
 # If 0 trades by 12:30 IST, relax STRONG_BUY from 0.45 → 0.40 for afternoon.
 RATING_AFTERNOON_RELAXED = 0.40    
