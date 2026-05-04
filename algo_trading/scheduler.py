@@ -54,12 +54,16 @@ class BotState:
     def save_state(self):
         """Persists critical state to disk to survive Termux/system restarts."""
         try:
+            # Use getattr to avoid AttributeError if keys were deleted on profit
+            last_loss_time = getattr(self, 'last_loss_time', None)
+            last_loss_dir  = getattr(self, 'last_loss_dir', None)
+
             data = {
                 "daily_trades":       self.daily_trades,
                 "consecutive_losses": self.consecutive_losses,
                 "active_position":    self.active_position,
-                "last_loss_time":     self.last_loss_time.isoformat() if self.last_loss_time else None,
-                "last_loss_dir":      self.last_loss_dir,
+                "last_loss_time":     last_loss_time.isoformat() if last_loss_time else None,
+                "last_loss_dir":      last_loss_dir,
                 "date":               datetime.now(IST).strftime("%Y-%m-%d")
             }
             with open(STATE_FILE, 'w') as f:
