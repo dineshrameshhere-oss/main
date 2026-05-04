@@ -451,6 +451,12 @@ def scalp_poll():
     if not hasattr(state, 'score_history'):
         state.score_history = []
     
+    rating = compute_multi_rating(window_df, rsi_window, adx_val, macd_w,
+                                   pcr=pcr_data, fnf_direction=fnf_dir, ivr_signal=ivr_sig,
+                                   score_history=state.score_history, mtf_score=mtf_score)
+    score  = rating['score']
+    bd     = rating['breakdown']
+
     # ── DIRECTIONAL TIMEOUT (Anti-Revenge) ──────────────────────────────
     # If a recent loss occurred, block re-entry in same direction for 30m
     now_ist = datetime.now(IST)
@@ -463,11 +469,9 @@ def scalp_poll():
                 log.warning(f"🚫 Directional Cooldown: Blocked {intended_dir} entry ({time_since_loss:.0f}m since last loss).")
                 is_blocked = True
     
-    rating = compute_multi_rating(window_df, rsi_window, adx_val, macd_w,
-                                   pcr=pcr_data, fnf_direction=fnf_dir, ivr_signal=ivr_sig,
-                                   score_history=state.score_history, mtf_score=mtf_score)
-    score  = 0.0 if is_blocked else rating['score']
-    bd     = rating['breakdown']
+    if is_blocked:
+        score = 0.0
+
     state.last_breakdown = bd   # stash for execute_scalp_trade OI log
 
     # Update history for NEXT poll
