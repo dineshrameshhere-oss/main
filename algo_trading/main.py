@@ -26,6 +26,20 @@ def print_banner(live_mode: bool = False, is_intraday: bool = False, use_ai: boo
 def main():
     load_dotenv()
 
+    # Utility: Update INDSTOCKS_TOKEN
+    if '--setToken' in sys.argv:
+        try:
+            token_idx = sys.argv.index('--setToken') + 1
+            if token_idx < len(sys.argv):
+                new_token = sys.argv[token_idx]
+                from .set_token import update_indstocks_token
+                update_indstocks_token(new_token)
+            else:
+                print("Usage: python -m algo_trading.main --setToken <YOUR_NEW_TOKEN>")
+        except Exception as e:
+            print(f"Error updating token: {e}")
+        return
+
     use_ai = '--ai' in sys.argv
 
     if '--startScalp' in sys.argv:
