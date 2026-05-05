@@ -151,8 +151,12 @@ def get_open_positions(live: bool = False) -> list:
         url = f"{INDSTOCKS_BASE}/portfolio/positions?segment=derivative&product=margin"
         res = requests.get(url, headers=get_auth_headers(), timeout=5)
         if res.status_code == 200:
-            data = res.json().get('data', {})
-            net_positions = data.get('net_positions', [])
+            data = res.json().get('data', [])
+            # API returns either a list directly or {"net_positions": [...]}
+            if isinstance(data, list):
+                net_positions = data
+            else:
+                net_positions = data.get('net_positions', [])
             open_pos = []
             for p in net_positions:
                 net_qty = int(p.get('net_quantity', 0))
