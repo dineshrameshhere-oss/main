@@ -533,13 +533,13 @@ def scalp_poll():
     choppy_warn = " ⚠️CHOPPY" if bd.get('choppy') else ""
     oi_type     = bd.get('oi_coverage', '')
     pcr_txt     = f" PCR:{bd.get('pcr_val',1.0):.2f}" if 'pcr_val' in bd else ""
-    vol_ok      = bd.get('volume_confirm', False)
+    # Volume from Nifty index candles is always 0 — display it but don't gate on it.
+    # PCR from instruments CSV has no OI column — always 1.0, display only.
     log.info(
         f"[{now.strftime('%H:%M')}] Sigma {rating['rating']} ({score:+.2f}) | "
         f"MTF:{mtf_score:+.2f} ADX:{bd.get('adx',0):.0f}{choppy_warn} RSI:{bd.get('rsi',0):.0f} "
         f"ORB:{bd.get('structure_orb',0):+.0f} OI:{oi_type}{pcr_txt} "
-        f"IVR:{ivr_data.get('ivr',50):.0f}({ivr_sig:+.2f}) "
-        f"Vol:{'OK' if vol_ok else 'NO'} Trades:{state.daily_trades}/3"
+        f"IVR:{ivr_data.get('ivr',50):.0f}({ivr_sig:+.2f}) Trades:{state.daily_trades}/3"
     )
 
     prev_score            = state.last_rating_score
@@ -552,26 +552,27 @@ def scalp_poll():
         log.warning("🚫 Opening block (before 09:50) — markets settling, no entry.")
         return
 
-    # ── Volume gate — hard block ──────────────────────────────────────────
-    # No volume = move not confirmed by market participation = false breakout.
-    if not vol_ok:
-        log.warning("🚫 No volume confirmation — skipping entry (false breakout risk).")
-        return
-
-    # ── PCR directional filter ───────────────────────────────────────────
-    # Neutral PCR means market is undecided. Don't pick a side against the crowd.
-    pcr_val = bd.get('pcr_val', 1.0)
-    if score > 0 and pcr_val > 0.95:
-        log.warning(f"🚫 PCR {pcr_val:.2f} is neutral/bearish — blocks CALL entry.")
-        return
-    if score < 0 and pcr_val < 1.05:
-        log.warning(f"🚫 PCR {pcr_val:.2f} is neutral/bullish — blocks PUT entry.")
-        return
+    # ── Consecutive signal agreement gate ────────────────────────────────
+    # Require the last 2 scored polls to agree on direction before entering.
+    # Prevents entering on a single-bar spike that immediately reverses.
+    if len(state.score_history) >= 2:
+        prev_two = state.score_history[-2:]
+        same_dir_count = sum(
+            1 for s in prev_two
+            if (score > 0 and s > 0.3) or (score < 0 and s < -0.3)
+        )
+        if same_dir_count < 2:
+            log.warning(
+                f"🚫 Signal not confirmed by prior bars "
+                f"(history {[round(s,2) for s in prev_two]}) — skipping."
+            )
+            return
 
     # Afternoon safety net: if 0 trades by 12:30, relax threshold slightly
     _strong_thresh = RATING_STRONG_BUY
 
     # ── Morning Volatility Buffer (09:50–10:10) ──────────────────────────
+    OPEN_SAFE = 9 * 60 + 50
     is_morning = OPEN_SAFE <= now_hm <= (10 * 60 + 10)
     if is_morning:
         _strong_thresh = 0.90
