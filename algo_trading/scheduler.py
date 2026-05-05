@@ -22,7 +22,7 @@ from .indicators import (
     compute_greeks, check_rv_gate, compute_mtf_trend_score
 )
 from .llm_analyst import analyze_premarket, analyze_market_open
-from .options_engine import select_strike, calculate_qty, calculate_dynamic_risk, compute_pcr
+from .options_engine import select_strike, calculate_qty, calculate_dynamic_risk, compute_pcr, select_banknifty_strike
 from .trade_executor import place_order, get_balance, close_order, square_off_all_open_positions
 from .risk_manager import monitor_position
 
@@ -464,7 +464,7 @@ def scalp_poll():
         return
 
     # ── Fetch data & compute rating ─────────────────────────────────────
-    df_3m, df_5m, df_15m, df_1m = _get_enriched_df()
+    df_3m, df_5m, df_15m, _ = _get_enriched_df()
     if df_5m is None or df_5m.empty:
         log.warning("⚠️ [Poll] No live data. Retry next cycle.")
         return
