@@ -23,7 +23,7 @@ from .indicators import (
 )
 from .llm_analyst import analyze_premarket, analyze_market_open
 from .options_engine import select_strike, calculate_qty, calculate_dynamic_risk, compute_pcr
-from .trade_executor import place_order, get_balance, close_order
+from .trade_executor import place_order, get_balance, close_order, square_off_all_open_positions
 from .risk_manager import monitor_position
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -558,6 +558,10 @@ def start_scheduler(live_mode: bool = False, use_ai: bool = False):
     state.use_ai = use_ai
     mode_str = '🔴 LIVE' if live_mode else '🟢 PAPER'
     ai_str = 'Enabled' if use_ai else 'Disabled'
+
+    # ── Startup: square off any stale broker positions before trading ────
+    if live_mode and not state.active_position:
+        square_off_all_open_positions(live=True)
 
     balance = get_balance(live_mode)
     log.info(f"\n{'='*52}")

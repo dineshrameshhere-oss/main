@@ -128,6 +128,57 @@ def _write_balance(balance: float):
         json.dump({'balance': round(balance, 2)}, f)
 
 
+def get_open_positions(live: bool = False) -> list:
+    """
+    Fetches open derivative positions from the broker.
+    Requires both segment=derivative AND product=margin per INDstocks API docs.
+    Returns a list of dicts with security_id, qty, trading_symbol.
+    Returns empty list on paper mode or API failure.
+    """
+    if not live:
+        return []
+    import requests
+    from .market_data import get_auth_headers
+    from .config import INDSTOCKS_BASE
+    try:
+        url = f"{INDSTOCKS_BASE}/portfolio/positions?segment=derivative&product=margin"
+        res = requests.get(url, headers=get_auth_headers(), timeout=5)
+        if res.status_code == 200:
+            data = res.json().get('data', {})
+            net_positions = data.get('net_positions', [])
+            open_pos = []
+            for p in net_positions:
+                net_qty = int(p.get('net_quantity', 0))
+                if net_qty != 0:
+                    open_pos.append({
+                        'security_id': p.get('security_id', ''),
+                        'qty':         abs(net_qty),
+                        'order_id':    p.get('trading_symbol', 'BROKER'),
+                    })
+            return open_pos
+        log.warning(f"⚠️ Positions API {res.status_code}: {res.text[:120]}")
+    except Exception as e:
+        log.warning(f"⚠️ Could not fetch open positions: {e}")
+    return []
+
+
+def square_off_all_open_positions(live: bool = False):
+    """Fetches all open derivative positions and places MARKET SELL to close each."""
+    if not live:
+        return
+    positions = get_open_positions(live=True)
+    if not positions:
+        log.info("✅ No open broker positions found.")
+        return
+    log.warning(f"⚠️ Found {len(positions)} open position(s) on broker — squaring off...")
+    for pos in positions:
+        close_order(
+            pos['order_id'], 'STARTUP_SQUAREOFF',
+            pnl=0.0, live=True,
+            security_id=pos['security_id'], qty=pos['qty'],
+        )
+
+
 def close_order(order_id: str, exit_reason: str, pnl: float = 0.0, live: bool = False,
                 security_id: str = None, qty: int = 0) -> bool:
     """
