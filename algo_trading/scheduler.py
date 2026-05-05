@@ -22,7 +22,12 @@ from .indicators import (
     compute_greeks, check_rv_gate, compute_mtf_trend_score
 )
 from .llm_analyst import analyze_premarket, analyze_market_open
+<<<<<<< HEAD
 from .options_engine import select_strike, calculate_qty, calculate_dynamic_risk, compute_pcr
+=======
+from .options_engine import (select_strike, calculate_qty, calculate_dynamic_risk, compute_pcr,
+                             select_banknifty_strike)
+>>>>>>> b221b0e90c5f2d3cf091289d8b400844fa483584
 from .trade_executor import place_order, get_balance, close_order, square_off_all_open_positions
 from .risk_manager import monitor_position
 
@@ -281,9 +286,8 @@ def _on_position_closed(pnl: float = 0.0):
                 state.last_loss_dir  = "CALL" if "CE" in pos.get('security_id', '') else "PUT"
         else:
             state.consecutive_losses = 0
-            # Reset loss tracking on profit
-            if hasattr(state, 'last_loss_time'): del state.last_loss_time
-            if hasattr(state, 'last_loss_dir'):  del state.last_loss_dir
+            state.last_loss_time = None
+            state.last_loss_dir  = None
 
         state.active_position = None
         state.save_state()  # Persist immediately on trade close
@@ -295,7 +299,8 @@ def _on_position_closed(pnl: float = 0.0):
 #  TRADE EXECUTION
 # ─────────────────────────────────────────────────────────────────────────────
 def execute_scalp_trade(rating_score: float, direction: str,
-                        df_enriched=None, pcr: dict | None = None):
+                        df_enriched=None, pcr: dict | None = None,
+                        ivr_data: dict | None = None):
     """Enters a trade after passing all quality filters."""
     if state.daily_trades >= 3:
         log.warning("🚫 Max 3 trades/day reached.")
@@ -323,39 +328,70 @@ def execute_scalp_trade(rating_score: float, direction: str,
         log.info(f"  📊 PCR={pcr.get('pcr',1.0):.2f} ({pcr.get('bias','N/A')}) | included in composite score")
 
 
-    # ── 4. Strike selection ───────────────────────────────────────────────
+    # ── 4. Strike selection (Nifty first, BankNifty fallback) ────────────
+    from .config import OTM_VOL_MIN_SCORE, OTM_VOL_MAX_HOLD_MIN, OTM_STAGNATION_TICKS
+
     spot        = float(df['Close'].iloc[-1])
-    strike_info = select_strike(direction, spot, current_balance)
+    ivr         = ivr_data.get('ivr', 50.0) if ivr_data else 50.0
+    strike_info = select_strike(direction, spot, current_balance, ivr=ivr)
     premium     = strike_info.get('simulated_premium', 0.0)
 
     if premium <= 0:
-        log.warning("⚠️ No valid live premium — skipping trade.")
-        return
+        # Nifty delta-gate fired — try BankNifty (lot 15, ATM fits ₹5K budget).
+        log.info("ℹ️ Nifty strike blocked — checking BankNifty NSE options as fallback...")
+        strike_info = select_banknifty_strike(direction, current_balance, ivr=ivr)
+        premium     = strike_info.get('simulated_premium', 0.0)
+        if premium <= 0:
+            log.warning("⚠️ BankNifty also has no quality strike — skipping trade this cycle.")
+            return
+        log.info(f"🔀 Switching to BANKNIFTY options for this trade (direction: {direction})")
 
-    # ── Greeks: score contribution (no hard gate) ──────────────────────────────
+    # ── Vol-mode gate: OTM entries require max-conviction score ───────────
+    vol_mode = strike_info.get('vol_mode', False)
+    if vol_mode and abs(rating_score) < OTM_VOL_MIN_SCORE:
+        log.warning(
+            f"🚫 OTM Vol Mode blocked: score {rating_score:+.2f} needs ±{OTM_VOL_MIN_SCORE}. "
+            f"Signals not strong enough to justify OTM risk — skipping."
+        )
+        return
+    if vol_mode:
+        log.info(
+            f"⚡ OTM VOL MODE | Score {rating_score:+.2f} ≥ {OTM_VOL_MIN_SCORE} ✓ | "
+            f"Max hold: {OTM_VOL_MAX_HOLD_MIN}min | Continuous theta-bleed exit active"
+        )
+
+    # Correct scaled spot for Greeks calculation.
+    # select_strike/select_banknifty_strike already used real spot internally.
+    # Use strike as spot proxy if df Close is scaled (~1081).
+    if spot < 10000:
+        spot = float(strike_info['strike'])
+
+    # ── Greeks check ───────────────────────────────────────────────────────
     opt_type    = 'CE' if direction == 'SCALP_LONG' else 'PE'
     days_to_exp = strike_info.get('days_to_expiry', 7)
     greeks      = compute_greeks(spot, strike_info['strike'], days_to_exp, premium, opt_type)
-    # Delta score: deep OTM options (delta<0.2) lower score but don't block
     greek_bonus = 0.0
-    if   greeks['delta'] >= 0.45: greek_bonus = +0.08  # near ATM — good sensitivity
+    if   greeks['delta'] >= 0.45: greek_bonus = +0.08
     elif greeks['delta'] >= 0.30: greek_bonus = +0.03
-    elif greeks['delta'] <  0.15: greek_bonus = -0.10  # deep OTM — penalise
-    
-    # Check if Greek adjustment pulls score below execution threshold
-    # For SELL signals (negative score), we check if score + bonus is > -threshold
+    elif greeks['delta'] <  0.15: greek_bonus = -0.10
+
     is_long = direction == 'SCALP_LONG'
     effective_score = rating_score + (greek_bonus if is_long else -greek_bonus)
     threshold = RATING_STRONG_BUY * 0.90
-    
+
     if (is_long and effective_score < threshold) or (not is_long and effective_score > -threshold):
         log.warning(f"⚠️ Greek penalty pulls score below threshold — δ={greeks['delta']:.3f} | Skipping.")
         return
     log.info(f"  ✅ Greeks — δ={greeks['delta']:.3f} γ={greeks['gamma']:.5f} "
              f"θ={greeks['theta']:.1f}₹/day IV={greeks['iv_pct']:.0f}% greek_bonus={greek_bonus:+.2f}")
 
-    is_strong = abs(rating_score) >= 0.85
-    qty, cost, _ = calculate_qty(current_balance, premium, is_strong_conviction=is_strong)
+    is_banknifty = strike_info.get('index') == 'BANKNIFTY'
+    is_strong    = abs(rating_score) >= 0.85
+
+    from .config import BANKNIFTY_LOT_SIZE
+    lot_size_to_use = BANKNIFTY_LOT_SIZE if is_banknifty else None   # None → uses config.LOT_SIZE
+    qty, cost, _ = calculate_qty(current_balance, premium, is_strong_conviction=is_strong,
+                                  lot_size=lot_size_to_use)
     if qty == 0:
         log.warning(f"⚠️ Insufficient balance for 1 lot @ ₹{premium:.2f}.")
         return
@@ -364,13 +400,13 @@ def execute_scalp_trade(rating_score: float, direction: str,
     sl_price = round(premium * (1 - sl_pct), 2)
     tp_price = round(premium * (1 + tp_pct), 2)
 
-    # OI coverage for log (from rating breakdown if available)
-    bd       = getattr(state, 'last_breakdown', {})
-    oi_type  = bd.get('oi_coverage', 'N/A')
+    bd          = getattr(state, 'last_breakdown', {})
+    oi_type     = bd.get('oi_coverage', 'N/A')
+    index_label = 'BANKNIFTY' if is_banknifty else 'NIFTY'
     log.info(
-        f"🎯 NIFTY {strike_info['strike']} {opt_type} | "
+        f"🎯 {index_label} {strike_info['strike']} {opt_type} | "
         f"Premium ₹{premium:.2f} | Qty {qty} | Cost ₹{cost:.0f} | "
-        f"SL ₹{sl_price:.2f} | TP ₹{tp_price:.2f} | "
+        f"SL ₹{sl_price:.2f} ({sl_pct*100:.0f}%) | TP ₹{tp_price:.2f} | "
         f"Score {rating_score:+.2f} | OI:{oi_type}"
     )
 
@@ -380,6 +416,13 @@ def execute_scalp_trade(rating_score: float, direction: str,
     )
     if not order:
         return
+
+    # Tag OTM vol mode onto the order so the monitor thread enforces speed rules.
+    # entry_theta (₹/day) lets the monitor compute per-tick decay without extra API calls.
+    if vol_mode:
+        order['otm_vol_mode'] = True
+        order['max_hold_min'] = OTM_VOL_MAX_HOLD_MIN
+        order['entry_theta']  = float(greeks.get('theta', 0.0))
 
     # Monitor thread takes over
     with state.active_position_lock:
@@ -411,7 +454,7 @@ def scalp_poll():
 
     if now_hm < OPEN or now_hm > CLOSE:
         return
-    if NOON_S <= now_hm <= NOON_E:
+    if NOON_S <= now_hm < NOON_E:
         return
 
     # ── Already in a trade? ─────────────────────────────────────────────
@@ -518,8 +561,8 @@ def scalp_poll():
         log.debug(f"Morning Volatility Buffer: threshold raised to {_strong_thresh}")
 
     if (state.daily_trades == 0
-            and now.hour > AFTERNOON_HOUR
-            or (now.hour == AFTERNOON_HOUR and now.minute >= AFTERNOON_MIN)):
+            and (now.hour > AFTERNOON_HOUR
+                 or (now.hour == AFTERNOON_HOUR and now.minute >= AFTERNOON_MIN))):
         _strong_thresh = RATING_AFTERNOON_RELAXED
         log.debug(f"Afternoon relaxed threshold: {_strong_thresh} (0 trades today)")
 
@@ -527,27 +570,27 @@ def scalp_poll():
     # If Gemini pre-market analysis is enabled and has a bias, we follow it.
     if state.use_ai:
         premarket_bias = state.premarket_analysis.get('strategy_suggestion', 'WAIT')
-        
+
         if score >= _strong_thresh and prev_score < _strong_thresh:
             if premarket_bias == 'BEARISH':
                 log.warning(f"⚠️ STRONG BUY blocked by LLM BEARISH bias ({premarket_bias})")
                 return
             log.info(f"🟢 STRONG BUY crossed +{RATING_STRONG_BUY} → Buy CE")
-            execute_scalp_trade(score, 'SCALP_LONG', df_enriched=df_5m, pcr=pcr_data)
+            execute_scalp_trade(score, 'SCALP_LONG', df_enriched=df_5m, pcr=pcr_data, ivr_data=ivr_data)
         elif score <= -_strong_thresh and prev_score > -_strong_thresh:
             if premarket_bias == 'BULLISH':
                 log.warning(f"⚠️ STRONG SELL blocked by LLM BULLISH bias ({premarket_bias})")
                 return
             log.info(f"🔴 STRONG SELL crossed {RATING_STRONG_SELL} → Buy PE")
-            execute_scalp_trade(score, 'SCALP_SHORT', df_enriched=df_5m, pcr=pcr_data)
+            execute_scalp_trade(score, 'SCALP_SHORT', df_enriched=df_5m, pcr=pcr_data, ivr_data=ivr_data)
     else:
         # Standard execution without AI bias
         if score >= _strong_thresh and prev_score < _strong_thresh:
             log.info(f"🟢 STRONG BUY crossed +{RATING_STRONG_BUY} → Buy CE")
-            execute_scalp_trade(score, 'SCALP_LONG', df_enriched=df_5m, pcr=pcr_data)
+            execute_scalp_trade(score, 'SCALP_LONG', df_enriched=df_5m, pcr=pcr_data, ivr_data=ivr_data)
         elif score <= -_strong_thresh and prev_score > -_strong_thresh:
             log.info(f"🔴 STRONG SELL crossed {RATING_STRONG_SELL} → Buy PE")
-            execute_scalp_trade(score, 'SCALP_SHORT', df_enriched=df_5m, pcr=pcr_data)
+            execute_scalp_trade(score, 'SCALP_SHORT', df_enriched=df_5m, pcr=pcr_data, ivr_data=ivr_data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -559,7 +602,13 @@ def start_scheduler(live_mode: bool = False, use_ai: bool = False):
     mode_str = '🔴 LIVE' if live_mode else '🟢 PAPER'
     ai_str = 'Enabled' if use_ai else 'Disabled'
 
+<<<<<<< HEAD
     # ── Startup: square off any stale broker positions before trading ────
+=======
+    # ── Startup broker position check ───────────────────────────────────
+    # Square off any stale open positions before starting fresh.
+    # Runs before resuming the monitor so we don't double-close.
+>>>>>>> b221b0e90c5f2d3cf091289d8b400844fa483584
     if live_mode and not state.active_position:
         square_off_all_open_positions(live=True)
 
@@ -579,13 +628,7 @@ def start_scheduler(live_mode: bool = False, use_ai: bool = False):
         from .risk_manager import monitor_position
         threading.Thread(
             target=monitor_position,
-            args=(state.active_position['order_id'], 
-                  state.active_position['security_id'],
-                  state.active_position['entry_price'],
-                  state.active_position['sl_price'],
-                  state.active_position['tp_price'],
-                  live_mode,
-                  _on_position_closed),
+            args=(state.active_position, live_mode, _on_position_closed),
             daemon=True
         ).start()
 

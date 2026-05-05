@@ -39,24 +39,31 @@ def place_order(security_id: str, direction: str, qty: int,
     # ── LIVE TRADING ──────────────────────────────────────────────────────
     import requests
     from .market_data import get_auth_headers
-    from .config import INDSTOCKS_BASE, ALGO_ID
+    from .config import INDSTOCKS_BASE, ALGO_ID, LOT_SIZE, SENSEX_LOT_SIZE
 
-    # FIX: The /order API expects raw numeric ID, but our internal logic uses 'NFO_' prefix.
-    raw_security_id = security_id.replace('NFO_', '')
+    # Detect exchange and strip internal prefix from security_id.
+    # NFO_XXXXX → NSE derivatives (Nifty options)
+    # BFO_XXXXX → BSE derivatives (Sensex options)
+    if security_id.startswith('BFO_'):
+        exchange        = 'BSE'
+        raw_security_id = security_id.replace('BFO_', '')
+        _lot            = SENSEX_LOT_SIZE
+    else:
+        exchange        = 'NSE'
+        raw_security_id = security_id.replace('NFO_', '')
+        _lot            = LOT_SIZE
 
     # ── QTY SAFETY CHECK ──────────────────────────────────────────────────
-    # NSE requires Nifty quantities to be multiples of 65.
-    if 'NIFTY' in security_id.upper() or int(raw_security_id) > 0:
-        if qty % 65 != 0:
-            old_qty = qty
-            qty = (qty // 65) * 65
-            if qty == 0: qty = 65
-            log.warning(f"⚠️ Qty Adjustment: {old_qty} → {qty} (must be multiple of 65 for Nifty)")
+    if qty % _lot != 0:
+        old_qty = qty
+        qty = (qty // _lot) * _lot
+        if qty == 0: qty = _lot
+        log.warning(f"⚠️ Qty Adjustment: {old_qty} → {qty} (must be multiple of {_lot} for {exchange})")
+        order['qty'] = qty   # keep order dict in sync so monitor closes correct qty
 
-    # Use standard /order endpoint as per documentation for reliability
     payload = {
         'txn_type':         txn_type,
-        'exchange':         'NSE',
+        'exchange':         exchange,
         'segment':          'DERIVATIVE',
         'product':          'MARGIN',
         'order_type':       'LIMIT',
@@ -131,8 +138,12 @@ def _write_balance(balance: float):
 def get_open_positions(live: bool = False) -> list:
     """
     Fetches open derivative positions from the broker.
+<<<<<<< HEAD
     Requires both segment=derivative AND product=margin per INDstocks API docs.
     Returns a list of dicts with security_id, qty, trading_symbol.
+=======
+    Returns a list of dicts with security_id, qty, product.
+>>>>>>> b221b0e90c5f2d3cf091289d8b400844fa483584
     Returns empty list on paper mode or API failure.
     """
     if not live:
@@ -141,6 +152,7 @@ def get_open_positions(live: bool = False) -> list:
     from .market_data import get_auth_headers
     from .config import INDSTOCKS_BASE
     try:
+<<<<<<< HEAD
         url = f"{INDSTOCKS_BASE}/portfolio/positions?segment=derivative&product=margin"
         res = requests.get(url, headers=get_auth_headers(), timeout=5)
         if res.status_code == 200:
@@ -157,13 +169,37 @@ def get_open_positions(live: bool = False) -> list:
                     })
             return open_pos
         log.warning(f"⚠️ Positions API {res.status_code}: {res.text[:120]}")
+=======
+        url = f"{INDSTOCKS_BASE}/positions"
+        res = requests.get(url, headers=get_auth_headers(), timeout=5)
+        if res.status_code == 200:
+            data = res.json().get('data', [])
+            open_pos = []
+            for p in (data if isinstance(data, list) else []):
+                net_qty = int(p.get('net_qty', p.get('netQty', p.get('quantity', 0))))
+                if net_qty != 0 and p.get('segment', '').upper() in ('DERIVATIVE', 'FNO', 'NFO'):
+                    open_pos.append({
+                        'security_id': f"NFO_{p.get('security_id', p.get('securityId', ''))}",
+                        'qty':         abs(net_qty),
+                        'order_id':    p.get('order_id', p.get('orderId', 'BROKER')),
+                    })
+            return open_pos
+        log.warning(f"⚠️ Positions API {res.status_code}: {res.text[:80]}")
+>>>>>>> b221b0e90c5f2d3cf091289d8b400844fa483584
     except Exception as e:
         log.warning(f"⚠️ Could not fetch open positions: {e}")
     return []
 
 
 def square_off_all_open_positions(live: bool = False):
+<<<<<<< HEAD
     """Fetches all open derivative positions and places MARKET SELL to close each."""
+=======
+    """
+    Fetches all open derivative positions from broker and places MARKET SELL to close.
+    Called at startup to ensure no stale positions are left from a previous run.
+    """
+>>>>>>> b221b0e90c5f2d3cf091289d8b400844fa483584
     if not live:
         return
     positions = get_open_positions(live=True)
@@ -175,7 +211,12 @@ def square_off_all_open_positions(live: bool = False):
         close_order(
             pos['order_id'], 'STARTUP_SQUAREOFF',
             pnl=0.0, live=True,
+<<<<<<< HEAD
             security_id=pos['security_id'], qty=pos['qty'],
+=======
+            security_id=pos['security_id'],
+            qty=pos['qty']
+>>>>>>> b221b0e90c5f2d3cf091289d8b400844fa483584
         )
 
 
@@ -199,13 +240,12 @@ def close_order(order_id: str, exit_reason: str, pnl: float = 0.0, live: bool = 
     from .config import INDSTOCKS_BASE, ALGO_ID
 
     # ── CASE 1: SQUARE OFF ACTIVE POSITION ──────────────────────────────────
-    # If we have a security_id and qty, it means the order was filled.
-    # We must place a SELL order to close it.
     if security_id and qty > 0:
-        raw_security_id = security_id.replace('NFO_', '')
+        exchange        = 'BSE' if security_id.startswith('BFO_') else 'NSE'
+        raw_security_id = security_id.replace('BFO_', '').replace('NFO_', '')
         payload = {
             'txn_type':         'SELL',
-            'exchange':         'NSE',
+            'exchange':         exchange,
             'segment':          'DERIVATIVE',
             'product':          'MARGIN',
             'order_type':       'MARKET',   # Use MARKET for fast exit on SL/TP
