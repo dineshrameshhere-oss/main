@@ -195,15 +195,17 @@ MOMENTUM_MIN_MOVE_PCT = 0.0005  # 0.05% net move in signal direction over 30 min
 # Let winners run. First rung at +20% gives breathing room against noise.
 # Each tuple: (profit_trigger_pct, locked_sl_floor_pct). SL only moves UP.
 TRAILING_STEPS = [
-    (0.20, 0.08),   # +20% → lock +8%   (first lock — now definitely profitable)
-    (0.30, 0.15),   # +30% → lock +15%
-    (0.40, 0.22),   # +40% → lock +22%
-    (0.50, 0.30),   # +50% → lock +30%  (solid win locked)
-    (0.75, 0.45),   # +75% → lock +45%
-    (1.00, 0.60),   # +100% → lock +60% (doubled money, can't lose now)
-    (1.50, 0.80),   # +150% → lock +80%
-    (2.00, 1.00),   # +200% → lock +100% (tripled money)
-    (3.00, 1.50),   # +300% → lock +150% (extreme momentum day)
+    (0.05, 0.00),   # +5%  → lock break-even  (never give back a winner)
+    (0.10, 0.05),   # +10% → lock +5%
+    (0.20, 0.12),   # +20% → lock +12%
+    (0.30, 0.18),   # +30% → lock +18%
+    (0.40, 0.25),   # +40% → lock +25%
+    (0.50, 0.32),   # +50% → lock +32%
+    (0.75, 0.48),   # +75% → lock +48%
+    (1.00, 0.62),   # +100% → lock +62%
+    (1.50, 0.82),   # +150% → lock +82%
+    (2.00, 1.00),   # +200% → lock +100%
+    (3.00, 1.50),   # +300% → lock +150%
 ]
 
 # Brokerage + API cost per round-trip (buy + sell)

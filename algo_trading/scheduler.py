@@ -494,23 +494,22 @@ def scalp_poll():
         state.score_history = []
     
     # ── STARTUP CONSISTENCY CHECK ───────────────────────────────────────
-    # If the bot just started, we require at least 2 bars of consistent bias
-    # to prevent immediate "fake" signals from stale or outlier candles.
+    # Hard block until 2 bars observed. Penalizing by 0.3 still allowed entry —
+    # this is a clean gate: observe and return, no entry possible.
     is_startup = len(state.score_history) < 2
-    
+
     rating = compute_multi_rating(window_df, rsi_window, adx_val, macd_w,
                                    pcr=pcr_data, fnf_direction=fnf_dir, ivr_signal=ivr_sig,
                                    score_history=state.score_history, mtf_score=mtf_score)
     score  = rating['score']
     bd     = rating['breakdown']
 
-    # If startup, we penalize the score to prevent immediate entry
     if is_startup:
-        log.info("🕒 Bot startup: Waiting for 2nd bar consistency check...")
-        score *= 0.3  # Drastically reduce conviction for the very first poll cycle after restart
+        log.info("🕒 Bot startup: Need 2 confirmed bars — observing, no entry yet.")
+        state.score_history.append(score)
+        return
 
     # ── DIRECTIONAL TIMEOUT (Anti-Revenge) ──────────────────────────────
-    # If a recent loss occurred, block re-entry in same direction for 30m
     now_ist = datetime.now(IST)
     is_blocked = False
     if state.last_loss_time and state.last_loss_dir:
@@ -520,11 +519,11 @@ def scalp_poll():
             if intended_dir == state.last_loss_dir and intended_dir != "NONE":
                 log.warning(f"🚫 Directional Cooldown: Blocked {intended_dir} entry ({time_since_loss:.0f}m since last loss).")
                 is_blocked = True
-    
+
     if is_blocked:
         score = 0.0
 
-    state.last_breakdown = bd   # stash for execute_scalp_trade OI log
+    state.last_breakdown = bd
 
     # Update history for NEXT poll
     state.score_history.append(score)
@@ -534,26 +533,49 @@ def scalp_poll():
     choppy_warn = " ⚠️CHOPPY" if bd.get('choppy') else ""
     oi_type     = bd.get('oi_coverage', '')
     pcr_txt     = f" PCR:{bd.get('pcr_val',1.0):.2f}" if 'pcr_val' in bd else ""
+    vol_ok      = bd.get('volume_confirm', False)
     log.info(
         f"[{now.strftime('%H:%M')}] Sigma {rating['rating']} ({score:+.2f}) | "
         f"MTF:{mtf_score:+.2f} ADX:{bd.get('adx',0):.0f}{choppy_warn} RSI:{bd.get('rsi',0):.0f} "
         f"ORB:{bd.get('structure_orb',0):+.0f} OI:{oi_type}{pcr_txt} "
         f"IVR:{ivr_data.get('ivr',50):.0f}({ivr_sig:+.2f}) "
-        f"Vol:{'OK' if bd.get('volume_confirm') else 'NO'} Trades:{state.daily_trades}/3"
+        f"Vol:{'OK' if vol_ok else 'NO'} Trades:{state.daily_trades}/3"
     )
 
     prev_score            = state.last_rating_score
     state.last_rating_score = score
 
+    # ── Hard opening window block (09:35–09:50) ──────────────────────────
+    # First 15 min after open: gap-fills, stop hunts, fakeouts. Never enter.
+    OPEN_SAFE = 9 * 60 + 50
+    if now_hm < OPEN_SAFE:
+        log.warning("🚫 Opening block (before 09:50) — markets settling, no entry.")
+        return
+
+    # ── Volume gate — hard block ──────────────────────────────────────────
+    # No volume = move not confirmed by market participation = false breakout.
+    if not vol_ok:
+        log.warning("🚫 No volume confirmation — skipping entry (false breakout risk).")
+        return
+
+    # ── PCR directional filter ───────────────────────────────────────────
+    # Neutral PCR means market is undecided. Don't pick a side against the crowd.
+    pcr_val = bd.get('pcr_val', 1.0)
+    if score > 0 and pcr_val > 0.95:
+        log.warning(f"🚫 PCR {pcr_val:.2f} is neutral/bearish — blocks CALL entry.")
+        return
+    if score < 0 and pcr_val < 1.05:
+        log.warning(f"🚫 PCR {pcr_val:.2f} is neutral/bullish — blocks PUT entry.")
+        return
+
     # Afternoon safety net: if 0 trades by 12:30, relax threshold slightly
     _strong_thresh = RATING_STRONG_BUY
-    
-    # ── Morning Volatility Buffer (09:35 - 10:00) ────────────────────────
-    # Require higher conviction during the chaotic opening period.
-    is_morning = (9 * 60 + 35) <= now_hm <= (10 * 60 + 0)
+
+    # ── Morning Volatility Buffer (09:50–10:10) ──────────────────────────
+    is_morning = OPEN_SAFE <= now_hm <= (10 * 60 + 10)
     if is_morning:
-        _strong_thresh = 0.85  # Strict threshold for morning entries
-        log.debug(f"Morning Volatility Buffer: threshold raised to {_strong_thresh}")
+        _strong_thresh = 0.90
+        log.debug(f"Morning buffer active: threshold raised to {_strong_thresh}")
 
     if (state.daily_trades == 0
             and (now.hour > AFTERNOON_HOUR
