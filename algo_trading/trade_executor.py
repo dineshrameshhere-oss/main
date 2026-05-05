@@ -138,12 +138,8 @@ def _write_balance(balance: float):
 def get_open_positions(live: bool = False) -> list:
     """
     Fetches open derivative positions from the broker.
-<<<<<<< HEAD
     Requires both segment=derivative AND product=margin per INDstocks API docs.
     Returns a list of dicts with security_id, qty, trading_symbol.
-=======
-    Returns a list of dicts with security_id, qty, product.
->>>>>>> b221b0e90c5f2d3cf091289d8b400844fa483584
     Returns empty list on paper mode or API failure.
     """
     if not live:
@@ -152,7 +148,6 @@ def get_open_positions(live: bool = False) -> list:
     from .market_data import get_auth_headers
     from .config import INDSTOCKS_BASE
     try:
-<<<<<<< HEAD
         url = f"{INDSTOCKS_BASE}/portfolio/positions?segment=derivative&product=margin"
         res = requests.get(url, headers=get_auth_headers(), timeout=5)
         if res.status_code == 200:
@@ -169,37 +164,13 @@ def get_open_positions(live: bool = False) -> list:
                     })
             return open_pos
         log.warning(f"⚠️ Positions API {res.status_code}: {res.text[:120]}")
-=======
-        url = f"{INDSTOCKS_BASE}/positions"
-        res = requests.get(url, headers=get_auth_headers(), timeout=5)
-        if res.status_code == 200:
-            data = res.json().get('data', [])
-            open_pos = []
-            for p in (data if isinstance(data, list) else []):
-                net_qty = int(p.get('net_qty', p.get('netQty', p.get('quantity', 0))))
-                if net_qty != 0 and p.get('segment', '').upper() in ('DERIVATIVE', 'FNO', 'NFO'):
-                    open_pos.append({
-                        'security_id': f"NFO_{p.get('security_id', p.get('securityId', ''))}",
-                        'qty':         abs(net_qty),
-                        'order_id':    p.get('order_id', p.get('orderId', 'BROKER')),
-                    })
-            return open_pos
-        log.warning(f"⚠️ Positions API {res.status_code}: {res.text[:80]}")
->>>>>>> b221b0e90c5f2d3cf091289d8b400844fa483584
     except Exception as e:
         log.warning(f"⚠️ Could not fetch open positions: {e}")
     return []
 
 
 def square_off_all_open_positions(live: bool = False):
-<<<<<<< HEAD
     """Fetches all open derivative positions and places MARKET SELL to close each."""
-=======
-    """
-    Fetches all open derivative positions from broker and places MARKET SELL to close.
-    Called at startup to ensure no stale positions are left from a previous run.
-    """
->>>>>>> b221b0e90c5f2d3cf091289d8b400844fa483584
     if not live:
         return
     positions = get_open_positions(live=True)
@@ -211,12 +182,7 @@ def square_off_all_open_positions(live: bool = False):
         close_order(
             pos['order_id'], 'STARTUP_SQUAREOFF',
             pnl=0.0, live=True,
-<<<<<<< HEAD
             security_id=pos['security_id'], qty=pos['qty'],
-=======
-            security_id=pos['security_id'],
-            qty=pos['qty']
->>>>>>> b221b0e90c5f2d3cf091289d8b400844fa483584
         )
 
 

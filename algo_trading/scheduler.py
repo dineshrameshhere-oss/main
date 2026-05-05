@@ -22,12 +22,7 @@ from .indicators import (
     compute_greeks, check_rv_gate, compute_mtf_trend_score
 )
 from .llm_analyst import analyze_premarket, analyze_market_open
-<<<<<<< HEAD
 from .options_engine import select_strike, calculate_qty, calculate_dynamic_risk, compute_pcr
-=======
-from .options_engine import (select_strike, calculate_qty, calculate_dynamic_risk, compute_pcr,
-                             select_banknifty_strike)
->>>>>>> b221b0e90c5f2d3cf091289d8b400844fa483584
 from .trade_executor import place_order, get_balance, close_order, square_off_all_open_positions
 from .risk_manager import monitor_position
 
@@ -602,13 +597,7 @@ def start_scheduler(live_mode: bool = False, use_ai: bool = False):
     mode_str = '🔴 LIVE' if live_mode else '🟢 PAPER'
     ai_str = 'Enabled' if use_ai else 'Disabled'
 
-<<<<<<< HEAD
     # ── Startup: square off any stale broker positions before trading ────
-=======
-    # ── Startup broker position check ───────────────────────────────────
-    # Square off any stale open positions before starting fresh.
-    # Runs before resuming the monitor so we don't double-close.
->>>>>>> b221b0e90c5f2d3cf091289d8b400844fa483584
     if live_mode and not state.active_position:
         square_off_all_open_positions(live=True)
 
