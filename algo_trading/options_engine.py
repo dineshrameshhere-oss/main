@@ -394,12 +394,26 @@ def select_strike(direction: str, spot_price: float, budget: float, ivr: float =
                 return _empty
 
         if best_choice['premium'] < MIN_PREMIUM_ENTRY:
-            log.warning(
-                f"🚫 Best strike {best_choice['strike']} {opt_type} "
-                f"premium ₹{best_choice['premium']:.2f} < ₹{MIN_PREMIUM_ENTRY} minimum. "
-                f"Bid-ask spread would eat SL — skipping."
-            )
-            return _empty
+            # ATM premium collapsed (near expiry / low IV). Try stepping ITM to find
+            # a candidate with enough premium to survive the bid-ask spread.
+            itm_fallback = [
+                c for c in candidates
+                if c['premium'] >= MIN_PREMIUM_ENTRY
+            ]
+            if itm_fallback:
+                # Among valid-premium candidates, pick the one with delta closest to 0.50
+                best_choice = min(itm_fallback, key=lambda x: abs(x['delta'] - 0.50))
+                log.info(
+                    f"ℹ️ ATM premium too low — stepping to ITM fallback: "
+                    f"{best_choice['strike']} {opt_type} @ ₹{best_choice['premium']:.2f} "
+                    f"(δ={best_choice['delta']:.2f})"
+                )
+            else:
+                log.warning(
+                    f"🚫 No {opt_type} strike has premium ≥ ₹{MIN_PREMIUM_ENTRY}. "
+                    f"Market premiums too low (near expiry / low IV) — skipping."
+                )
+                return _empty
 
         tag = " [OTM VOL MODE]" if vol_mode else ""
         log.info(
