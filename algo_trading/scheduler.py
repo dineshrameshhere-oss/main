@@ -324,7 +324,7 @@ def execute_scalp_trade(rating_score: float, direction: str,
 
 
     # ── 4. Strike selection (Nifty first, BankNifty fallback) ────────────
-    from .config import OTM_VOL_MIN_SCORE, OTM_VOL_MAX_HOLD_MIN, OTM_STAGNATION_TICKS
+    from .config import OTM_VOL_MIN_SCORE, OTM_VOL_MAX_HOLD_MIN
 
     spot        = float(df['Close'].iloc[-1])
     ivr         = ivr_data.get('ivr', 50.0) if ivr_data else 50.0
